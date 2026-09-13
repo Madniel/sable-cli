@@ -2,7 +2,7 @@ import { style } from './ansi.js';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
 
-const ORDER: Record<LogLevel, number> = {
+const SEVERITY: Record<LogLevel, number> = {
   debug: 10,
   info: 20,
   warn: 30,
@@ -10,32 +10,36 @@ const ORDER: Record<LogLevel, number> = {
   silent: 100,
 };
 
-let current: LogLevel = (process.env['SABLE_LOG_LEVEL'] as LogLevel | undefined) ?? 'info';
+function initialLevel(): LogLevel {
+  const fromEnv = process.env['SABLE_LOG_LEVEL'] as LogLevel | undefined;
+  return fromEnv && fromEnv in SEVERITY ? fromEnv : 'info';
+}
+
+let currentLevel: LogLevel = initialLevel();
 
 export function setLogLevel(level: LogLevel): void {
-  current = level;
+  currentLevel = level;
 }
 
 export function getLogLevel(): LogLevel {
-  return current;
+  return currentLevel;
 }
 
-function shouldLog(level: LogLevel): boolean {
-  return ORDER[level] >= ORDER[current];
+function enabled(level: LogLevel): boolean {
+  return SEVERITY[level] >= SEVERITY[currentLevel];
 }
 
-/** Diagnostics go to stderr so stdout stays a clean, pipeable channel. */
 export const log = {
   debug(...args: unknown[]): void {
-    if (shouldLog('debug')) console.error(style.gray('debug'), ...args);
+    if (enabled('debug')) console.error(style.gray('debug'), ...args);
   },
   info(...args: unknown[]): void {
-    if (shouldLog('info')) console.error(...args);
+    if (enabled('info')) console.error(...args);
   },
   warn(...args: unknown[]): void {
-    if (shouldLog('warn')) console.error(style.yellow('warn'), ...args);
+    if (enabled('warn')) console.error(style.yellow('warn'), ...args);
   },
   error(...args: unknown[]): void {
-    if (shouldLog('error')) console.error(style.red('error'), ...args);
+    if (enabled('error')) console.error(style.red('error'), ...args);
   },
 };

@@ -1,5 +1,3 @@
-/** Error types used across the CLI. All carry a stable `code` for handling upstream. */
-
 export type SableErrorCode =
   | 'CONFIG'
   | 'AUTH'
@@ -10,16 +8,16 @@ export type SableErrorCode =
   | 'ABORTED'
   | 'USAGE';
 
+export interface SableErrorOptions {
+  retryable?: boolean;
+  cause?: unknown;
+}
+
 export class SableError extends Error {
   readonly code: SableErrorCode;
-  /** True when retrying the same operation may succeed (e.g. a 429 or 5xx). */
   readonly retryable: boolean;
 
-  constructor(
-    code: SableErrorCode,
-    message: string,
-    options: { retryable?: boolean; cause?: unknown } = {},
-  ) {
+  constructor(code: SableErrorCode, message: string, options: SableErrorOptions = {}) {
     super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = 'SableError';
     this.code = code;
@@ -41,19 +39,23 @@ export class AuthError extends SableError {
   }
 }
 
+export interface ProviderErrorOptions extends SableErrorOptions {
+  status?: number;
+  retryAfterMs?: number;
+}
+
 export class ProviderError extends SableError {
   readonly status: number | undefined;
+  readonly retryAfterMs: number | undefined;
 
-  constructor(
-    message: string,
-    options: { status?: number; retryable?: boolean; cause?: unknown } = {},
-  ) {
+  constructor(message: string, options: ProviderErrorOptions = {}) {
     super('PROVIDER', message, {
       retryable: options.retryable ?? false,
       cause: options.cause,
     });
     this.name = 'ProviderError';
     this.status = options.status;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 
@@ -79,10 +81,12 @@ export class AbortError extends SableError {
 }
 
 export function isAbort(error: unknown): boolean {
-  return (
-    error instanceof AbortError ||
-    (error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError'))
-  );
+  if (error instanceof AbortError) return true;
+  return error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError');
+}
+
+export function isDenial(error: unknown): boolean {
+  return error instanceof SableError && error.code === 'TOOL_DENIED';
 }
 
 export function errorMessage(error: unknown): string {

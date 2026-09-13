@@ -1,72 +1,78 @@
-/**
- * Minimal ANSI helpers. No dependencies; honours NO_COLOR and non-TTY output.
- */
-
 const ESC = '\u001b';
 const CSI = `${ESC}[`;
+const SGR_PATTERN = new RegExp(`${ESC}\\[[0-9;]*m`, 'g');
+const MIN_USABLE_WIDTH = 20;
 
-let enabled =
-  process.stdout.isTTY === true && !process.env['NO_COLOR'] && process.env['TERM'] !== 'dumb';
+function detectColorSupport(): boolean {
+  if (process.env['NO_COLOR']) return false;
+  if (process.env['FORCE_COLOR']) return true;
+  if (process.env['TERM'] === 'dumb') return false;
+  return process.stdout.isTTY === true;
+}
+
+let colorIsEnabled = detectColorSupport();
 
 export function setColorEnabled(value: boolean): void {
-  enabled = value;
+  colorIsEnabled = value;
 }
 
 export function colorEnabled(): boolean {
-  return enabled;
+  return colorIsEnabled;
 }
 
-function wrap(open: number, close: number) {
-  return (text: string): string => (enabled ? `${CSI}${open}m${text}${CSI}${close}m` : text);
+function sgr(open: number, close: number) {
+  return (text: string): string => (colorIsEnabled ? `${CSI}${open}m${text}${CSI}${close}m` : text);
 }
 
 export const style = {
   reset: `${CSI}0m`,
-  bold: wrap(1, 22),
-  dim: wrap(2, 22),
-  italic: wrap(3, 23),
-  underline: wrap(4, 24),
-  inverse: wrap(7, 27),
-  strike: wrap(9, 29),
+  bold: sgr(1, 22),
+  dim: sgr(2, 22),
+  italic: sgr(3, 23),
+  underline: sgr(4, 24),
+  inverse: sgr(7, 27),
+  strike: sgr(9, 29),
 
-  red: wrap(31, 39),
-  green: wrap(32, 39),
-  yellow: wrap(33, 39),
-  blue: wrap(34, 39),
-  magenta: wrap(35, 39),
-  cyan: wrap(36, 39),
-  white: wrap(37, 39),
-  gray: wrap(90, 39),
+  red: sgr(31, 39),
+  green: sgr(32, 39),
+  yellow: sgr(33, 39),
+  blue: sgr(34, 39),
+  magenta: sgr(35, 39),
+  cyan: sgr(36, 39),
+  white: sgr(37, 39),
+  gray: sgr(90, 39),
 
-  bgRed: wrap(41, 49),
-  bgGreen: wrap(42, 49),
-  bgYellow: wrap(43, 49),
+  bgRed: sgr(41, 49),
+  bgGreen: sgr(42, 49),
+  bgYellow: sgr(43, 49),
 } as const;
 
 export const cursor = {
   hide(): void {
-    if (enabled) process.stderr.write(`${CSI}?25l`);
+    if (colorIsEnabled) process.stderr.write(`${CSI}?25l`);
   },
   show(): void {
-    if (enabled) process.stderr.write(`${CSI}?25h`);
+    if (colorIsEnabled) process.stderr.write(`${CSI}?25h`);
   },
   clearLine(): void {
-    if (enabled) process.stderr.write(`${CSI}2K\r`);
+    if (colorIsEnabled) process.stderr.write(`${CSI}2K\r`);
   },
 };
 
-const ANSI_PATTERN = new RegExp(`${ESC}\\[[0-9;]*m`, 'g');
-
 export function stripAnsi(text: string): string {
-  return text.replace(ANSI_PATTERN, '');
+  return text.replace(SGR_PATTERN, '');
 }
 
-/** Visible width of a string, ignoring ANSI escape sequences. */
 export function visibleWidth(text: string): number {
   return stripAnsi(text).length;
 }
 
 export function terminalWidth(fallback = 80): number {
   const columns = process.stdout.columns;
-  return typeof columns === 'number' && columns > 20 ? columns : fallback;
+  return typeof columns === 'number' && columns > MIN_USABLE_WIDTH ? columns : fallback;
+}
+
+export function truncateToWidth(text: string, width: number): string {
+  if (visibleWidth(text) <= width) return text;
+  return `${stripAnsi(text).slice(0, Math.max(0, width - 1))}…`;
 }
