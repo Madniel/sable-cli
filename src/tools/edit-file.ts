@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 
 import { ToolDeniedError } from '../util/errors.js';
+import { diffStats, unifiedDiff } from '../util/diff.js';
+import { applyEdits, pluralize, type EditSpec } from './edits.js';
+import { rel, resolveOrThrow, staleFileResult } from './fs-utils.js';
 import { objectSchema } from './schema.js';
-import { previewReplacement, rel, resolveOrThrow } from './fs-utils.js';
 import { fail, ok, type Tool, type ToolContext, type ToolResult } from './types.js';
 
 export const editFileTool: Tool = {
@@ -12,7 +14,7 @@ export const editFileTool: Tool = {
     'Replace an exact string in a file. `old_string` must appear exactly once unless',
     'you set `replace_all`. Include enough surrounding context to make the match',
     'unambiguous. Read the file first: an edit against contents you have not seen is',
-    'how files get corrupted.',
+    'how files get corrupted. To make several changes to one file, use multi_edit.',
   ].join(' '),
   schema: objectSchema(
     {
@@ -35,65 +37,48 @@ export const editFileTool: Tool = {
     return `edit ${String(params['path'])}`;
   },
 
-  async run(params, ctx: ToolContext): Promise<ToolResult> {
-    const file = resolveOrThrow(ctx.root, String(params['path']), 'edit_file');
-    const oldString = String(params['old_string']);
-    const newString = String(params['new_string']);
-    const replaceAll = params['replace_all'] === true;
+  async run(params, context: ToolContext): Promise<ToolResult> {
+    const file = resolveOrThrow(context.root, String(params['path']), 'edit_file');
 
-    if (oldString === newString) {
-      return fail('edit_file: old_string and new_string are identical; nothing to do.');
-    }
     if (!fs.existsSync(file)) {
-      return fail(`edit_file: no such file: ${rel(ctx.root, file)}. Use write_file to create it.`);
+      return fail(
+        `edit_file: no such file: ${rel(context.root, file)}. Use write_file to create it.`,
+      );
     }
+
+    const stale = staleFileResult(context, file, 'edit_file');
+    if (stale) return stale;
+
+    const edit: EditSpec = {
+      oldString: String(params['old_string']),
+      newString: String(params['new_string']),
+      replaceAll: params['replace_all'] === true,
+    };
 
     const before = fs.readFileSync(file, 'utf8');
-    const occurrences = countOccurrences(before, oldString);
+    const outcome = applyEdits(before, [edit], rel(context.root, file));
 
-    if (occurrences === 0) {
-      return fail(
-        `edit_file: old_string was not found in ${rel(ctx.root, file)}. ` +
-          'Read the file and match its exact current text, including whitespace.',
-      );
-    }
-    if (occurrences > 1 && !replaceAll) {
-      return fail(
-        `edit_file: old_string appears ${occurrences} times in ${rel(ctx.root, file)}. ` +
-          'Add surrounding context to make it unique, or set replace_all=true.',
-      );
-    }
+    if (!outcome.applied) return fail(`edit_file: ${outcome.reason}`);
 
-    const after = replaceAll
-      ? before.split(oldString).join(newString)
-      : before.replace(oldString, newString);
-
-    const outcome = await ctx.confirm({
+    const stats = diffStats(before, outcome.content);
+    const approved = await context.confirm({
       toolName: 'edit_file',
       kind: 'write',
-      summary: `Edit ${rel(ctx.root, file)}${replaceAll ? ` (${occurrences} occurrences)` : ''}`,
-      detail: previewReplacement(before, after),
+      summary: `Edit ${rel(context.root, file)} (+${stats.added} -${stats.removed})`,
+      detail: unifiedDiff(before, outcome.content),
     });
-    if (outcome === 'reject') {
-      throw new ToolDeniedError(`The user declined the edit to ${rel(ctx.root, file)}.`);
+
+    if (approved === 'reject') {
+      throw new ToolDeniedError(`The user declined the edit to ${rel(context.root, file)}.`);
     }
 
-    fs.writeFileSync(file, after, 'utf8');
+    fs.writeFileSync(file, outcome.content, 'utf8');
+    context.files.record(file);
 
     return ok(
-      `Edited ${rel(ctx.root, file)} (${occurrences} replacement${occurrences === 1 ? '' : 's'}).`,
-      `edited ${rel(ctx.root, file)}`,
+      `Edited ${rel(context.root, file)} (${pluralize(outcome.replacements, 'replacement')}, ` +
+        `+${stats.added} -${stats.removed} lines).`,
+      `edited ${rel(context.root, file)} (+${stats.added} -${stats.removed})`,
     );
   },
 };
-
-function countOccurrences(haystack: string, needle: string): number {
-  if (needle === '') return 0;
-  let count = 0;
-  let index = haystack.indexOf(needle);
-  while (index !== -1) {
-    count++;
-    index = haystack.indexOf(needle, index + needle.length);
-  }
-  return count;
-}

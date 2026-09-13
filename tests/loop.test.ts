@@ -4,68 +4,36 @@ import path from 'node:path';
 import test, { describe } from 'node:test';
 
 import { Agent } from '../src/agent/loop.js';
-import { Session } from '../src/agent/session.js';
 import { ApprovalPolicy } from '../src/approval/policy.js';
-import type {
-  CompletionRequest,
-  CompletionResult,
-  Provider,
-  StreamEvent,
-} from '../src/providers/types.js';
+import type { CompletionResult } from '../src/providers/types.js';
 import { ToolRegistry } from '../src/tools/registry.js';
-import { tempWorkspace, testConfig } from './helpers.js';
-
-/** A provider that replays a script, so the loop can be tested without a network. */
-class ScriptedProvider implements Provider {
-  readonly id = 'scripted';
-  readonly label = 'Scripted';
-  readonly knownModels = ['test-model'] as const;
-  readonly requests: CompletionRequest[] = [];
-
-  constructor(private readonly script: CompletionResult[]) {}
-
-  async complete(
-    request: CompletionRequest,
-    onEvent: (event: StreamEvent) => void,
-  ): Promise<CompletionResult> {
-    this.requests.push(structuredClone(request));
-    const next = this.script.shift();
-    if (!next) throw new Error('ScriptedProvider ran out of scripted responses');
-    for (const block of next.message.content) {
-      if (block.type === 'text') onEvent({ type: 'text_delta', text: block.text });
-    }
-    return next;
-  }
-}
-
-const usage = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 };
-
-function reply(text: string): CompletionResult {
-  return {
-    message: { role: 'assistant', content: [{ type: 'text', text }] },
-    stopReason: 'end_turn',
-    usage,
-  };
-}
-
-function callTool(id: string, name: string, input: unknown): CompletionResult {
-  return {
-    message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] },
-    stopReason: 'tool_use',
-    usage,
-  };
-}
+import {
+  ScriptedProvider,
+  callTool,
+  reply,
+  tempWorkspace,
+  testConfig,
+  testSession,
+} from './helpers.js';
+import type { Config } from '../src/config/config.js';
 
 function buildAgent(
   root: string,
   script: CompletionResult[],
   approval: ApprovalPolicy = new ApprovalPolicy('yolo'),
+  configOverrides: Partial<Config> = {},
 ) {
-  const config = testConfig(root, { approval: approval.getMode() });
+  const config = testConfig(root, { approval: approval.getMode(), ...configOverrides });
   const provider = new ScriptedProvider(script);
-  const session = new Session('test-model');
+  const session = testSession(root);
   const agent = new Agent({ config, provider, tools: new ToolRegistry(), approval, session });
-  return { agent, provider, session };
+
+  return { agent, provider, session, config };
+}
+
+function lastToolResult(provider: ScriptedProvider, requestIndex: number) {
+  const block = provider.requests[requestIndex]?.messages.at(-1)?.content[0];
+  return block?.type === 'tool_result' ? block : null;
 }
 
 describe('Agent.run', () => {
@@ -90,6 +58,7 @@ describe('Agent.run', () => {
 
     const started: string[] = [];
     const ended: boolean[] = [];
+
     const result = await agent.run('read a.txt', {
       onToolStart: ({ name }) => started.push(name),
       onToolEnd: ({ ok }) => ended.push(ok),
@@ -98,13 +67,7 @@ describe('Agent.run', () => {
     assert.deepEqual(started, ['read_file']);
     assert.deepEqual(ended, [true]);
     assert.equal(result.steps, 2);
-
-    const secondRequest = provider.requests[1];
-    const lastMessage = secondRequest?.messages.at(-1);
-    assert.equal(lastMessage?.role, 'user');
-    const block = lastMessage?.content[0];
-    assert.equal(block?.type, 'tool_result');
-    assert.match(block?.type === 'tool_result' ? block.content : '', /contents here/);
+    assert.match(lastToolResult(provider, 1)?.content ?? '', /contents here/);
   });
 
   test('hands a validation error back to the model instead of throwing', async () => {
@@ -116,10 +79,9 @@ describe('Agent.run', () => {
 
     await agent.run('go');
 
-    const block = provider.requests[1]?.messages.at(-1)?.content[0];
-    assert.equal(block?.type, 'tool_result');
-    assert.equal(block?.type === 'tool_result' ? block.isError : false, true);
-    assert.match(block?.type === 'tool_result' ? block.content : '', /unknown argument/);
+    const result = lastToolResult(provider, 1);
+    assert.equal(result?.isError, true);
+    assert.match(result?.content ?? '', /unknown argument/);
   });
 
   test('an unknown tool name comes back as a recoverable error', async () => {
@@ -131,11 +93,7 @@ describe('Agent.run', () => {
 
     await agent.run('go');
 
-    const block = provider.requests[1]?.messages.at(-1)?.content[0];
-    assert.match(
-      block?.type === 'tool_result' ? block.content : '',
-      /Unknown tool "launch_missiles"/,
-    );
+    assert.match(lastToolResult(provider, 1)?.content ?? '', /Unknown tool "launch_missiles"/);
   });
 
   test('readonly mode refuses writes and explains why', async () => {
@@ -149,18 +107,28 @@ describe('Agent.run', () => {
     await agent.run('write a file');
 
     assert.equal(fs.existsSync(path.join(root, 'x.txt')), false);
-    const block = provider.requests[1]?.messages.at(-1)?.content[0];
-    assert.match(block?.type === 'tool_result' ? block.content : '', /read-only mode/);
+    assert.match(lastToolResult(provider, 1)?.content ?? '', /read-only mode/);
   });
 
-  test('stops at maxSteps rather than looping forever', async () => {
-    const root = tempWorkspace({ 'a.txt': 'x' });
-    const script = Array.from({ length: 10 }, (_, i) =>
-      callTool(`t${i}`, 'read_file', { path: 'a.txt' }),
-    );
-    const config = testConfig(root, { maxSteps: 3 });
-    const provider = new ScriptedProvider(script);
-    const session = new Session('test-model');
+  test('runs several tool calls from one response in order', async () => {
+    const root = tempWorkspace({ 'a.txt': 'A', 'b.txt': 'B' });
+    const provider = new ScriptedProvider([
+      {
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 't1', name: 'read_file', input: { path: 'a.txt' } },
+            { type: 'tool_use', id: 't2', name: 'read_file', input: { path: 'b.txt' } },
+          ],
+        },
+        stopReason: 'tool_use',
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      },
+      reply('Both read.'),
+    ]);
+
+    const config = testConfig(root);
+    const session = testSession(root);
     const agent = new Agent({
       config,
       provider,
@@ -169,8 +137,36 @@ describe('Agent.run', () => {
       session,
     });
 
+    await agent.run('read both');
+
+    const results = provider.requests[1]?.messages.at(-1)?.content ?? [];
+    assert.equal(results.length, 2);
+    assert.equal(results[0]?.type === 'tool_result' ? results[0].toolUseId : '', 't1');
+    assert.equal(results[1]?.type === 'tool_result' ? results[1].toolUseId : '', 't2');
+  });
+
+  test('remembers reads across steps so edits are not blocked', async () => {
+    const root = tempWorkspace({ 'a.txt': 'original\n' });
+    const { agent } = buildAgent(root, [
+      callTool('t1', 'read_file', { path: 'a.txt' }),
+      callTool('t2', 'edit_file', { path: 'a.txt', old_string: 'original', new_string: 'edited' }),
+      reply('Done.'),
+    ]);
+
+    await agent.run('edit it');
+
+    assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'edited\n');
+  });
+
+  test('stops at maxSteps rather than looping forever', async () => {
+    const root = tempWorkspace({ 'a.txt': 'x' });
+    const script = Array.from({ length: 10 }, (_, i) =>
+      callTool(`t${i}`, 'read_file', { path: 'a.txt' }),
+    );
+    const { agent } = buildAgent(root, script, new ApprovalPolicy('yolo'), { maxSteps: 3 });
+
     const notices: string[] = [];
-    const result = await agent.run('loop', { onNotice: (m) => notices.push(m) });
+    const result = await agent.run('loop', { onNotice: (message) => notices.push(message) });
 
     assert.equal(result.steps, 3);
     assert.equal(result.exhausted, true);
@@ -185,10 +181,11 @@ describe('Agent.run', () => {
     ]);
 
     await agent.run('go');
+    const totals = session.totals();
 
-    assert.equal(session.totals().usage.inputTokens, 20);
-    assert.equal(session.totals().usage.outputTokens, 10);
-    assert.equal(session.totals().turns, 1);
+    assert.equal(totals.usage.inputTokens, 20);
+    assert.equal(totals.usage.outputTokens, 10);
+    assert.equal(totals.turns, 1);
   });
 
   test('an abort signal stops the turn', async () => {
@@ -199,12 +196,33 @@ describe('Agent.run', () => {
 
     await assert.rejects(() => agent.run('go', {}, controller.signal), /cancelled/i);
   });
+
+  test('notifies when a turn completes so the session can be saved', async () => {
+    const root = tempWorkspace({});
+    const config = testConfig(root);
+    const session = testSession(root);
+    let saved = 0;
+
+    const agent = new Agent({
+      config,
+      provider: new ScriptedProvider([reply('done')]),
+      tools: new ToolRegistry(),
+      approval: new ApprovalPolicy('yolo'),
+      session,
+      onTurnComplete: () => saved++,
+    });
+
+    await agent.run('go');
+
+    assert.equal(saved, 1);
+  });
 });
 
 describe('ApprovalPolicy', () => {
   test('read tools never prompt', async () => {
     const policy = new ApprovalPolicy('prompt');
     const outcome = await policy.confirm({ toolName: 'read_file', kind: 'read', summary: 'read' });
+
     assert.equal(outcome, 'once');
   });
 
@@ -248,8 +266,22 @@ describe('ApprovalPolicy', () => {
 
   test('with nobody to ask, the answer is no', async () => {
     const policy = new ApprovalPolicy('prompt', null);
+
     assert.equal(
       await policy.confirm({ toolName: 'shell', kind: 'execute', summary: 's' }),
+      'reject',
+    );
+  });
+
+  test('readonly refuses even when a prompt exists', async () => {
+    const policy = new ApprovalPolicy('readonly', {
+      async ask() {
+        throw new Error('should not be asked');
+      },
+    });
+
+    assert.equal(
+      await policy.confirm({ toolName: 'write_file', kind: 'write', summary: 'w' }),
       'reject',
     );
   });

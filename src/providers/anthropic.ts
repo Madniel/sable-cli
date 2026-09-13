@@ -1,5 +1,8 @@
-import { AuthError, ProviderError, isAbort } from '../util/errors.js';
+import { AuthError, ProviderError } from '../util/errors.js';
+import { describeFailure, requireStreamBody, withRetries, type Sleep } from './http.js';
+import { defaultSleep } from './http.js';
 import { readSSE } from './sse.js';
+import { parseToolInput } from './tool-input.js';
 import {
   EMPTY_USAGE,
   type CompletionRequest,
@@ -14,20 +17,14 @@ import {
 
 const DEFAULT_BASE_URL = 'https://api.anthropic.com';
 const API_VERSION = '2023-06-01';
-const MAX_ATTEMPTS = 4;
+const EPHEMERAL_CACHE = { type: 'ephemeral' as const };
 
 export interface AnthropicOptions {
   apiKey: string | undefined;
   baseUrl?: string | undefined;
-  /** Injectable for tests. Defaults to global fetch. */
   fetchImpl?: typeof fetch;
-  /** Injectable for tests so retries do not really sleep. */
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: Sleep;
 }
-
-/* -------------------------------------------------------------------------- */
-/* Wire types (only the fields we actually consume)                           */
-/* -------------------------------------------------------------------------- */
 
 interface WireUsage {
   input_tokens?: number;
@@ -53,15 +50,16 @@ interface WireEvent {
   error?: { type?: string; message?: string };
 }
 
-/** Partial state for one streaming content block. */
-interface BlockState {
-  type: 'text' | 'thinking' | 'tool_use';
+type BlockKind = 'text' | 'thinking' | 'tool_use';
+
+interface PartialBlock {
+  kind: BlockKind;
   text: string;
   thinking: string;
   signature: string | undefined;
   id: string;
   name: string;
-  json: string;
+  inputJson: string;
 }
 
 export class AnthropicProvider implements Provider {
@@ -77,13 +75,13 @@ export class AnthropicProvider implements Provider {
   private readonly apiKey: string | undefined;
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
-  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sleep: Sleep;
 
   constructor(options: AnthropicOptions) {
     this.apiKey = options.apiKey;
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
-    this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.sleep = options.sleep ?? defaultSleep;
   }
 
   async complete(
@@ -93,27 +91,14 @@ export class AnthropicProvider implements Provider {
   ): Promise<CompletionResult> {
     if (!this.apiKey) {
       throw new AuthError(
-        'No Anthropic API key found. Set ANTHROPIC_API_KEY in your environment or run `sable auth`.',
+        'No Anthropic API key found. Set ANTHROPIC_API_KEY in your environment before starting sable.',
       );
     }
 
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      try {
-        return await this.attempt(request, onEvent, signal);
-      } catch (error) {
-        lastError = error;
-        if (isAbort(error)) throw error;
-        const retryable = error instanceof ProviderError && error.retryable;
-        if (!retryable || attempt === MAX_ATTEMPTS) throw error;
-        const backoff = Math.min(30_000, 500 * 2 ** (attempt - 1)) + Math.random() * 250;
-        await this.sleep(backoff);
-      }
-    }
-    throw lastError;
+    return withRetries(() => this.sendOnce(request, onEvent, signal), this.sleep);
   }
 
-  private async attempt(
+  private async sendOnce(
     request: CompletionRequest,
     onEvent: (event: StreamEvent) => void,
     signal?: AbortSignal,
@@ -126,129 +111,63 @@ export class AnthropicProvider implements Provider {
         'anthropic-version': API_VERSION,
         accept: 'text/event-stream',
       },
-      body: JSON.stringify(this.buildBody(request)),
+      body: JSON.stringify(toWireRequest(request)),
       ...(signal ? { signal } : {}),
     });
 
-    if (!response.ok) {
-      throw await toProviderError(response);
-    }
-    if (!response.body) {
-      throw new ProviderError('The provider returned an empty response body.', { retryable: true });
-    }
+    if (!response.ok) throw await describeFailure(response);
 
-    return this.consume(response.body, onEvent, signal);
+    return this.readStream(requireStreamBody(response), onEvent, signal);
   }
 
-  private buildBody(request: CompletionRequest): Record<string, unknown> {
-    const tools = request.tools.map((tool, index) => ({
-      name: tool.name,
-      description: tool.description,
-      input_schema: tool.parameters,
-      // Cache the tool definitions; they are stable across a whole session.
-      ...(index === request.tools.length - 1
-        ? { cache_control: { type: 'ephemeral' as const } }
-        : {}),
-    }));
-
-    return {
-      model: request.model,
-      max_tokens: request.maxTokens,
-      ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
-      stream: true,
-      system: [{ type: 'text', text: request.system, cache_control: { type: 'ephemeral' } }],
-      tools,
-      messages: request.messages.map(toWireMessage),
-    };
-  }
-
-  private async consume(
+  private async readStream(
     body: ReadableStream<Uint8Array>,
     onEvent: (event: StreamEvent) => void,
     signal?: AbortSignal,
   ): Promise<CompletionResult> {
-    const blocks = new Map<number, BlockState>();
+    const blocks = new Map<number, PartialBlock>();
     let usage: Usage = { ...EMPTY_USAGE };
     let stopReason: StopReason = 'unknown';
 
     for await (const frame of readSSE(body, signal)) {
-      if (!frame.data) continue;
-      let event: WireEvent;
-      try {
-        event = JSON.parse(frame.data) as WireEvent;
-      } catch {
-        continue; // A malformed keep-alive is not worth killing the turn over.
-      }
+      const event = parseEvent(frame.data);
+      if (!event) continue;
 
       switch (event.type) {
         case 'message_start': {
-          const wire = event.message?.usage;
-          if (wire) {
-            usage = mergeUsage(usage, wire);
-            onEvent({ type: 'usage', usage });
-          }
+          if (!event.message?.usage) break;
+          usage = mergeUsage(usage, event.message.usage);
+          onEvent({ type: 'usage', usage });
           break;
         }
 
         case 'content_block_start': {
-          const index = event.index ?? 0;
-          const block = event.content_block;
+          const block = startBlock(event);
           if (!block) break;
-          const state: BlockState = {
-            type:
-              block.type === 'tool_use'
-                ? 'tool_use'
-                : block.type === 'thinking'
-                  ? 'thinking'
-                  : 'text',
-            text: block.text ?? '',
-            thinking: block.thinking ?? '',
-            signature: undefined,
-            id: block.id ?? '',
-            name: block.name ?? '',
-            json: '',
-          };
-          blocks.set(index, state);
-          if (state.type === 'tool_use') {
-            onEvent({ type: 'tool_use_start', id: state.id, name: state.name });
-          } else if (state.type === 'text' && state.text) {
-            onEvent({ type: 'text_delta', text: state.text });
+
+          blocks.set(event.index ?? 0, block);
+          if (block.kind === 'tool_use') {
+            onEvent({ type: 'tool_use_start', id: block.id, name: block.name });
+          } else if (block.kind === 'text' && block.text) {
+            onEvent({ type: 'text_delta', text: block.text });
           }
           break;
         }
 
         case 'content_block_delta': {
-          const index = event.index ?? 0;
-          const state = blocks.get(index);
-          const delta = event.delta;
-          if (!state || !delta) break;
-          if (delta.type === 'text_delta' && typeof delta.text === 'string') {
-            state.text += delta.text;
-            onEvent({ type: 'text_delta', text: delta.text });
-          } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
-            state.thinking += delta.thinking;
-            onEvent({ type: 'thinking_delta', text: delta.thinking });
-          } else if (delta.type === 'signature_delta' && typeof delta.signature === 'string') {
-            state.signature = (state.signature ?? '') + delta.signature;
-          } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
-            state.json += delta.partial_json;
-            onEvent({
-              type: 'tool_use_input_delta',
-              id: state.id,
-              partialJson: delta.partial_json,
-            });
-          }
+          const block = blocks.get(event.index ?? 0);
+          if (block) applyDelta(block, event, onEvent);
           break;
         }
 
         case 'content_block_stop': {
-          const state = blocks.get(event.index ?? 0);
-          if (state?.type === 'tool_use') {
+          const block = blocks.get(event.index ?? 0);
+          if (block?.kind === 'tool_use') {
             onEvent({
               type: 'tool_use_end',
-              id: state.id,
-              name: state.name,
-              input: parseToolInput(state.json),
+              id: block.id,
+              name: block.name,
+              input: parseToolInput(block.inputJson),
             });
           }
           break;
@@ -263,63 +182,35 @@ export class AnthropicProvider implements Provider {
           break;
         }
 
-        case 'error': {
-          const message = event.error?.message ?? 'The provider reported an error mid-stream.';
-          const type = event.error?.type ?? '';
-          throw new ProviderError(message, {
-            retryable: type === 'overloaded_error' || type === 'api_error',
-          });
-        }
+        case 'error':
+          throw streamError(event);
 
         default:
           break;
       }
     }
 
-    return { message: assemble(blocks), stopReason, usage };
+    return { message: assembleMessage(blocks), stopReason, usage };
   }
 }
 
-/* -------------------------------------------------------------------------- */
-/* Helpers                                                                    */
-/* -------------------------------------------------------------------------- */
+function toWireRequest(request: CompletionRequest): Record<string, unknown> {
+  const lastToolIndex = request.tools.length - 1;
 
-function assemble(blocks: Map<number, BlockState>): Message {
-  const content: ContentBlock[] = [];
-  for (const index of [...blocks.keys()].sort((a, b) => a - b)) {
-    const state = blocks.get(index);
-    if (!state) continue;
-    if (state.type === 'text') {
-      if (state.text) content.push({ type: 'text', text: state.text });
-    } else if (state.type === 'thinking') {
-      if (state.thinking) {
-        content.push({
-          type: 'thinking',
-          thinking: state.thinking,
-          ...(state.signature ? { signature: state.signature } : {}),
-        });
-      }
-    } else {
-      content.push({
-        type: 'tool_use',
-        id: state.id,
-        name: state.name,
-        input: parseToolInput(state.json),
-      });
-    }
-  }
-  return { role: 'assistant', content };
-}
-
-function parseToolInput(json: string): unknown {
-  const trimmed = json.trim();
-  if (!trimmed) return {};
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    // Surface the raw text so the tool layer can produce a useful error message.
-    return { __malformed_json__: trimmed };
-  }
+  return {
+    model: request.model,
+    max_tokens: request.maxTokens,
+    ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
+    stream: true,
+    system: [{ type: 'text', text: request.system, cache_control: EPHEMERAL_CACHE }],
+    tools: request.tools.map((tool, index) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.parameters,
+      ...(index === lastToolIndex ? { cache_control: EPHEMERAL_CACHE } : {}),
+    })),
+    messages: request.messages.map(toWireMessage),
+  };
 }
 
 function toWireMessage(message: Message): Record<string, unknown> {
@@ -349,6 +240,99 @@ function toWireMessage(message: Message): Record<string, unknown> {
   };
 }
 
+function parseEvent(data: string): WireEvent | null {
+  if (!data) return null;
+  try {
+    return JSON.parse(data) as WireEvent;
+  } catch {
+    return null;
+  }
+}
+
+function startBlock(event: WireEvent): PartialBlock | null {
+  const block = event.content_block;
+  if (!block) return null;
+
+  const kind: BlockKind =
+    block.type === 'tool_use' ? 'tool_use' : block.type === 'thinking' ? 'thinking' : 'text';
+
+  return {
+    kind,
+    text: block.text ?? '',
+    thinking: block.thinking ?? '',
+    signature: undefined,
+    id: block.id ?? '',
+    name: block.name ?? '',
+    inputJson: '',
+  };
+}
+
+function applyDelta(
+  block: PartialBlock,
+  event: WireEvent,
+  onEvent: (event: StreamEvent) => void,
+): void {
+  const delta = event.delta;
+  if (!delta) return;
+
+  switch (delta.type) {
+    case 'text_delta':
+      if (typeof delta.text !== 'string') return;
+      block.text += delta.text;
+      onEvent({ type: 'text_delta', text: delta.text });
+      return;
+
+    case 'thinking_delta':
+      if (typeof delta.thinking !== 'string') return;
+      block.thinking += delta.thinking;
+      onEvent({ type: 'thinking_delta', text: delta.thinking });
+      return;
+
+    case 'signature_delta':
+      if (typeof delta.signature !== 'string') return;
+      block.signature = (block.signature ?? '') + delta.signature;
+      return;
+
+    case 'input_json_delta':
+      if (typeof delta.partial_json !== 'string') return;
+      block.inputJson += delta.partial_json;
+      onEvent({ type: 'tool_use_input_delta', id: block.id, partialJson: delta.partial_json });
+      return;
+
+    default:
+      return;
+  }
+}
+
+function assembleMessage(blocks: Map<number, PartialBlock>): Message {
+  const indexes = [...blocks.keys()].sort((a, b) => a - b);
+  const content: ContentBlock[] = [];
+
+  for (const index of indexes) {
+    const block = blocks.get(index);
+    if (!block) continue;
+
+    if (block.kind === 'text' && block.text) {
+      content.push({ type: 'text', text: block.text });
+    } else if (block.kind === 'thinking' && block.thinking) {
+      content.push({
+        type: 'thinking',
+        thinking: block.thinking,
+        ...(block.signature ? { signature: block.signature } : {}),
+      });
+    } else if (block.kind === 'tool_use') {
+      content.push({
+        type: 'tool_use',
+        id: block.id,
+        name: block.name,
+        input: parseToolInput(block.inputJson),
+      });
+    }
+  }
+
+  return { role: 'assistant', content };
+}
+
 function mergeUsage(current: Usage, wire: WireUsage): Usage {
   return {
     inputTokens: wire.input_tokens ?? current.inputTokens,
@@ -370,27 +354,10 @@ function toStopReason(reason: string): StopReason {
   }
 }
 
-async function toProviderError(response: Response): Promise<ProviderError> {
-  let detail = '';
-  try {
-    const body = await response.text();
-    try {
-      const parsed = JSON.parse(body) as { error?: { message?: string } };
-      detail = parsed.error?.message ?? body;
-    } catch {
-      detail = body;
-    }
-  } catch {
-    detail = response.statusText;
-  }
-
-  if (response.status === 401 || response.status === 403) {
-    return new ProviderError(`Authentication failed (${response.status}). ${detail}`.trim(), {
-      status: response.status,
-    });
-  }
-
-  const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
-  const prefix = response.status === 429 ? 'Rate limited' : `Request failed (${response.status})`;
-  return new ProviderError(`${prefix}. ${detail}`.trim(), { status: response.status, retryable });
+function streamError(event: WireEvent): ProviderError {
+  const message = event.error?.message ?? 'The provider reported an error mid-stream.';
+  const type = event.error?.type ?? '';
+  return new ProviderError(message, {
+    retryable: type === 'overloaded_error' || type === 'api_error',
+  });
 }

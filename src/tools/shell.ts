@@ -1,26 +1,41 @@
 import { spawn } from 'node:child_process';
 
 import { ToolDeniedError } from '../util/errors.js';
-import { objectSchema } from './schema.js';
 import { rel, resolveOrThrow, truncate } from './fs-utils.js';
+import { objectSchema } from './schema.js';
 import { fail, ok, type Tool, type ToolContext, type ToolResult } from './types.js';
 
 const MAX_OUTPUT_CHARS = 30_000;
+const OUTPUT_HARD_LIMIT = MAX_OUTPUT_CHARS * 4;
+const SIGKILL_GRACE_MS = 2000;
+const SUMMARY_LENGTH = 90;
 
-/** Patterns that deserve a loud warning in the approval prompt. */
-const DANGEROUS_PATTERNS: { pattern: RegExp; why: string }[] = [
-  { pattern: /\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf]/, why: 'recursive or forced delete' },
-  { pattern: /\bmkfs(\.|\s)/, why: 'formats a filesystem' },
-  { pattern: /\bdd\s+if=/, why: 'raw disk write' },
-  { pattern: /:\(\)\s*\{.*\}\s*;\s*:/, why: 'fork bomb' },
+interface RiskPattern {
+  pattern: RegExp;
+  description: string;
+}
+
+const RISK_PATTERNS: RiskPattern[] = [
+  { pattern: /\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf]/, description: 'recursive or forced delete' },
+  { pattern: /\bmkfs(\.|\s)/, description: 'formats a filesystem' },
+  { pattern: /\bdd\s+if=/, description: 'raw disk write' },
+  { pattern: /:\(\)\s*\{.*\}\s*;\s*:/, description: 'fork bomb' },
   {
     pattern: /\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba)?sh/,
-    why: 'pipes a download straight into a shell',
+    description: 'pipes a download straight into a shell',
   },
-  { pattern: /\bgit\s+push\b.*(--force|-f)\b/, why: 'force push' },
-  { pattern: /\bsudo\b/, why: 'runs as root' },
-  { pattern: />\s*\/dev\/(sd|nvme|disk)/, why: 'writes to a block device' },
+  { pattern: /\bgit\s+push\b.*(--force|-f)\b/, description: 'force push' },
+  { pattern: /\bsudo\b/, description: 'runs as root' },
+  { pattern: />\s*\/dev\/(sd|nvme|disk)/, description: 'writes to a block device' },
 ];
+
+interface CommandResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  cancelled: boolean;
+}
 
 export const shellTool: Tool = {
   name: 'shell',
@@ -52,69 +67,73 @@ export const shellTool: Tool = {
 
   summarize(params) {
     const command = String(params['command']).replace(/\s+/g, ' ').trim();
-    return command.length > 90 ? `${command.slice(0, 87)}...` : command;
+    return command.length > SUMMARY_LENGTH ? `${command.slice(0, SUMMARY_LENGTH - 3)}...` : command;
   },
 
-  async run(params, ctx: ToolContext): Promise<ToolResult> {
+  async run(params, context: ToolContext): Promise<ToolResult> {
     const command = String(params['command']).trim();
     if (!command) return fail('shell: command is empty.');
 
-    const cwd = resolveOrThrow(ctx.root, String(params['cwd'] ?? '.'), 'shell');
-    const timeout = (params['timeout_ms'] as number | undefined) ?? ctx.config.shellTimeoutMs;
+    const cwd = resolveOrThrow(context.root, String(params['cwd'] ?? '.'), 'shell');
+    const timeoutMs = Number(params['timeout_ms'] ?? context.config.shellTimeoutMs);
 
-    const risks = DANGEROUS_PATTERNS.filter(({ pattern }) => pattern.test(command)).map(
-      ({ why }) => why,
-    );
-
-    const outcome = await ctx.confirm({
+    const approved = await context.confirm({
       toolName: 'shell',
       kind: 'execute',
       summary: `Run: ${this.summarize(params)}`,
-      detail: [
-        `$ ${command}`,
-        `  in ${rel(ctx.root, cwd)}`,
-        ...(risks.length ? [`  ⚠ ${risks.join('; ')}`] : []),
-      ].join('\n'),
+      detail: approvalDetail(command, rel(context.root, cwd)),
     });
-    if (outcome === 'reject') {
+
+    if (approved === 'reject') {
       throw new ToolDeniedError(`The user declined to run: ${command}`);
     }
 
-    const result = await execute(command, cwd, timeout, ctx);
+    const result = await execute(command, cwd, timeoutMs, context);
+    const output = `${statusLine(result, timeoutMs)}\n\n${combineStreams(result)}`;
+    const failed = result.timedOut || result.cancelled || (result.code ?? 1) !== 0;
 
-    const parts: string[] = [];
-    if (result.stdout.trim()) parts.push(result.stdout.trimEnd());
-    if (result.stderr.trim()) parts.push(`[stderr]\n${result.stderr.trimEnd()}`);
-    if (parts.length === 0) parts.push('(no output)');
-
-    const body = truncate(parts.join('\n\n'), MAX_OUTPUT_CHARS).text;
-    const status = result.timedOut
-      ? `Command timed out after ${timeout}ms.`
-      : `Exit code: ${result.code ?? 'unknown'}`;
-
-    const output = `${status}\n\n${body}`;
-    const failed = result.timedOut || (result.code ?? 1) !== 0;
-
-    return failed ? { output, isError: true } : ok(output, `ran: ${this.summarize(params)}`);
+    return failed ? fail(output) : ok(output, `ran: ${this.summarize(params)}`);
   },
 };
 
-interface ExecResult {
-  code: number | null;
-  stdout: string;
-  stderr: string;
-  timedOut: boolean;
+function approvalDetail(command: string, workingDirectory: string): string {
+  const risks = RISK_PATTERNS.filter(({ pattern }) => pattern.test(command)).map(
+    ({ description }) => description,
+  );
+
+  return [
+    `$ ${command}`,
+    `  in ${workingDirectory}`,
+    ...(risks.length > 0 ? [`  ! ${risks.join('; ')}`] : []),
+  ].join('\n');
+}
+
+function statusLine(result: CommandResult, timeoutMs: number): string {
+  if (result.cancelled) return 'Command cancelled by the user.';
+  if (result.timedOut) return `Command timed out after ${timeoutMs}ms.`;
+  return `Exit code: ${result.code ?? 'unknown'}`;
+}
+
+function combineStreams(result: CommandResult): string {
+  const sections: string[] = [];
+
+  if (result.stdout.trim()) sections.push(result.stdout.trimEnd());
+  if (result.stderr.trim()) sections.push(`[stderr]\n${result.stderr.trimEnd()}`);
+  if (sections.length === 0) sections.push('(no output)');
+
+  return truncate(sections.join('\n\n'), MAX_OUTPUT_CHARS).text;
 }
 
 function execute(
   command: string,
   cwd: string,
   timeoutMs: number,
-  ctx: ToolContext,
-): Promise<ExecResult> {
+  context: ToolContext,
+): Promise<CommandResult> {
   return new Promise((resolve) => {
-    const shell = process.platform === 'win32' ? 'cmd.exe' : '/bin/bash';
-    const args = process.platform === 'win32' ? ['/c', command] : ['-c', command];
+    const isWindows = process.platform === 'win32';
+    const shell = isWindows ? 'cmd.exe' : '/bin/bash';
+    const args = isWindows ? ['/c', command] : ['-c', command];
 
     const child = spawn(shell, args, {
       cwd,
@@ -122,49 +141,59 @@ function execute(
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
+    const state: CommandResult = {
+      code: null,
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+      cancelled: false,
+    };
+
     let settled = false;
+
+    const terminate = () => {
+      child.kill('SIGTERM');
+      setTimeout(() => {
+        if (!child.killed) child.kill('SIGKILL');
+      }, SIGKILL_GRACE_MS).unref?.();
+    };
+
+    const timer = setTimeout(() => {
+      state.timedOut = true;
+      terminate();
+    }, timeoutMs);
+
+    const onAbort = () => {
+      state.cancelled = true;
+      terminate();
+    };
 
     const finish = (code: number | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      ctx.signal.removeEventListener('abort', onAbort);
-      resolve({ code, stdout, stderr, timedOut });
+      context.signal.removeEventListener('abort', onAbort);
+      resolve({ ...state, code });
     };
 
-    const kill = () => {
-      child.kill('SIGTERM');
-      setTimeout(() => child.killed || child.kill('SIGKILL'), 2000).unref?.();
-    };
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      kill();
-    }, timeoutMs);
-
-    const onAbort = () => {
-      timedOut = false;
-      stderr += '\n[cancelled by user]';
-      kill();
-    };
-    ctx.signal.addEventListener('abort', onAbort, { once: true });
+    context.signal.addEventListener('abort', onAbort, { once: true });
 
     child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
-      if (stdout.length > MAX_OUTPUT_CHARS * 4) stdout = stdout.slice(-MAX_OUTPUT_CHARS * 2);
+      state.stdout = appendCapped(state.stdout, chunk.toString('utf8'));
     });
     child.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
-      if (stderr.length > MAX_OUTPUT_CHARS * 4) stderr = stderr.slice(-MAX_OUTPUT_CHARS * 2);
+      state.stderr = appendCapped(state.stderr, chunk.toString('utf8'));
     });
 
     child.on('error', (error) => {
-      stderr += `\n${error.message}`;
+      state.stderr = appendCapped(state.stderr, `\n${error.message}`);
       finish(null);
     });
     child.on('close', (code) => finish(code));
   });
+}
+
+function appendCapped(existing: string, addition: string): string {
+  const combined = existing + addition;
+  return combined.length > OUTPUT_HARD_LIMIT ? combined.slice(-MAX_OUTPUT_CHARS * 2) : combined;
 }

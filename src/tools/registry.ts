@@ -1,20 +1,24 @@
 import type { ToolSpec } from '../providers/types.js';
 import { ToolInputError } from '../util/errors.js';
 import { validate } from './schema.js';
-import type { Tool } from './types.js';
+import type { Tool, ToolKind } from './types.js';
 
 import { editFileTool } from './edit-file.js';
+import { globTool } from './glob.js';
 import { grepTool } from './grep.js';
 import { listDirTool } from './list-dir.js';
+import { multiEditTool } from './multi-edit.js';
 import { readFileTool } from './read-file.js';
 import { shellTool } from './shell.js';
 import { writeFileTool } from './write-file.js';
 
 export const BUILT_IN_TOOLS: Tool[] = [
   listDirTool,
+  globTool,
   readFileTool,
   grepTool,
   editFileTool,
+  multiEditTool,
   writeFileTool,
   shellTool,
 ];
@@ -46,12 +50,14 @@ export class ToolRegistry {
     return [...this.tools.keys()];
   }
 
-  /** Keep only tools that do not modify anything. Used by `--approval readonly`. */
-  readOnly(): ToolRegistry {
-    return new ToolRegistry(this.list().filter((tool) => tool.kind === 'read'));
+  ofKind(kind: ToolKind): Tool[] {
+    return this.list().filter((tool) => tool.kind === kind);
   }
 
-  /** The tool definitions sent to the model. */
+  readOnly(): ToolRegistry {
+    return new ToolRegistry(this.ofKind('read'));
+  }
+
   specs(): ToolSpec[] {
     return this.list().map((tool) => ({
       name: tool.name,
@@ -60,14 +66,15 @@ export class ToolRegistry {
     }));
   }
 
-  /** Validate raw model-supplied input against the tool's schema. */
   validateInput(name: string, input: unknown): Record<string, unknown> {
     const tool = this.get(name);
+
     if (!tool) {
       throw new ToolInputError(
         `Unknown tool "${name}". Available tools: ${this.names().join(', ')}.`,
       );
     }
+
     return validate(tool.schema, input, name);
   }
 }

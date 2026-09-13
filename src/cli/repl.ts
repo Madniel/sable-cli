@@ -2,7 +2,8 @@ import readline from 'node:readline';
 
 import { Agent, type AgentEvents } from '../agent/loop.js';
 import { formatCost } from '../agent/pricing.js';
-import { Session } from '../agent/session.js';
+import type { Session } from '../agent/session.js';
+import { findSession, saveSnapshot } from '../agent/store.js';
 import { ApprovalPolicy, type ApprovalPrompt } from '../approval/policy.js';
 import type { Config } from '../config/config.js';
 import type { Provider } from '../providers/types.js';
@@ -22,12 +23,13 @@ import {
 } from './render.js';
 import { commandNames, handleSlash } from './slash.js';
 
+const HISTORY_SIZE = 200;
+
 export interface ReplOptions {
   config: Config;
   provider: Provider;
   tools: ToolRegistry;
   session: Session;
-  /** Prompt to run immediately on start, before handing over to the user. */
   initialPrompt?: string | undefined;
 }
 
@@ -38,13 +40,14 @@ export class Repl implements ApprovalPrompt {
   private readonly session: Session;
   private readonly approval: ApprovalPolicy;
   private readonly agent: Agent;
-  private readonly rl: readline.Interface;
+  private readonly input: readline.Interface;
 
   private busy = false;
   private exiting = false;
-  private queue: string[] = [];
-  private controller: AbortController | null = null;
+  private queued: string[] = [];
+  private turnController: AbortController | null = null;
   private interruptArmed = false;
+  private activeWork: Promise<void> = Promise.resolve();
 
   constructor(options: ReplOptions) {
     this.config = options.config;
@@ -52,107 +55,144 @@ export class Repl implements ApprovalPrompt {
     this.tools = options.tools;
     this.session = options.session;
     this.approval = new ApprovalPolicy(this.config.approval, this);
+
     this.agent = new Agent({
       config: this.config,
       provider: this.provider,
       tools: this.tools,
       approval: this.approval,
       session: this.session,
+      onTurnComplete: (session) => this.persist(session),
     });
 
-    this.rl = readline.createInterface({
+    this.input = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
       prompt: style.cyan('› '),
-      historySize: 200,
+      historySize: HISTORY_SIZE,
       completer: (line: string) => this.complete(line),
     });
 
-    if (options.initialPrompt) this.queue.push(options.initialPrompt);
+    if (options.initialPrompt) this.queued.push(options.initialPrompt);
   }
 
   async start(): Promise<number> {
     process.stdout.write(
-      banner(this.session.getModel(), tildify(this.config.workspaceRoot), this.approval.getMode()),
+      banner(
+        this.session.getModel(),
+        tildify(this.config.workspaceRoot),
+        this.approval.getMode(),
+        this.config.provider,
+      ),
     );
 
-    this.rl.on('line', (line) => {
-      this.interruptArmed = false;
-      const trimmed = line.trim();
-      if (this.busy) {
-        if (trimmed) this.queue.push(trimmed);
-        return;
-      }
-      void this.handle(trimmed);
-    });
+    this.input.on('line', (line) => this.onLine(line));
+    this.input.on('SIGINT', () => this.onInterrupt());
 
-    this.rl.on('SIGINT', () => this.onInterrupt());
+    const closed = new Promise<void>((resolve) =>
+      this.input.on('close', () => {
+        this.exiting = true;
+        this.queued = [];
+        this.turnController?.abort();
+        resolve();
+      }),
+    );
 
-    const closed = new Promise<void>((resolve) => {
-      this.rl.on('close', () => resolve());
-    });
-
-    if (this.queue.length > 0) {
-      void this.drain();
-    } else {
-      this.rl.prompt();
-    }
+    if (this.queued.length > 0) this.track(this.drainQueue());
+    else this.input.prompt();
 
     await closed;
+    await this.activeWork;
     this.printFarewell();
+
     return 0;
   }
 
-  /* ---------------------------------------------------------------- input */
+  async ask(request: ConfirmRequest): Promise<ConfirmOutcome> {
+    process.stdout.write(
+      [
+        '',
+        `${style.yellow('?')} ${style.bold(request.summary)}`,
+        ...(request.detail ? [indentDetail(request.detail)] : []),
+        style.gray(`  [y] yes   [a] always allow ${request.toolName}   [n] no`),
+        '',
+      ].join('\n'),
+    );
+
+    const answer = await this.question(style.cyan('  › '));
+    if (answer === null) return 'reject';
+
+    const normalized = answer.trim().toLowerCase();
+    if (normalized === 'a' || normalized === 'always') return 'always';
+    if (normalized === '' || normalized === 'y' || normalized === 'yes') return 'once';
+
+    return 'reject';
+  }
+
+  private onLine(line: string): void {
+    this.interruptArmed = false;
+    const trimmed = line.trim();
+
+    if (this.busy) {
+      if (trimmed) this.queued.push(trimmed);
+      return;
+    }
+
+    this.track(this.handle(trimmed));
+  }
+
+  private track(work: Promise<void>): void {
+    this.activeWork = work.catch(() => undefined);
+  }
 
   private async handle(input: string): Promise<void> {
     if (this.exiting) return;
 
     if (!input) {
-      this.rl.prompt();
+      this.input.prompt();
       return;
     }
 
-    if (
-      handleSlash(input, {
-        config: this.config,
-        session: this.session,
-        approval: this.approval,
-        tools: this.tools,
-        provider: this.provider,
-        agent: this.agent,
-        print: (text) => process.stdout.write(`${text}\n`),
-        requestExit: () => {
-          this.exiting = true;
-          this.rl.close();
-        },
-      })
-    ) {
-      if (!this.exiting) this.rl.prompt();
+    const wasCommand = await handleSlash(input, this.slashContext());
+
+    if (wasCommand) {
+      if (!this.exiting) this.input.prompt();
       return;
     }
 
     await this.runTurn(input);
-    await this.drain();
+    await this.drainQueue();
   }
 
-  private async drain(): Promise<void> {
-    while (this.queue.length > 0 && !this.exiting) {
-      const next = this.queue.shift();
+  private async drainQueue(): Promise<void> {
+    while (this.queued.length > 0 && !this.exiting) {
+      const next = this.queued.shift();
       if (!next) continue;
+
       process.stdout.write(`${style.cyan('› ')}${next}\n`);
       await this.runTurn(next);
     }
-    if (!this.exiting) this.rl.prompt();
+
+    if (!this.exiting) this.input.prompt();
   }
 
   private async runTurn(input: string): Promise<void> {
+    if (this.exiting) return;
+
     this.busy = true;
-    this.controller = new AbortController();
+    this.turnController = new AbortController();
 
     const spinner = new Spinner();
     const renderer = new StreamRenderer(process.stdout);
     let streaming = false;
+
+    const stopStreaming = () => {
+      spinner.stop();
+      if (streaming) {
+        renderer.end();
+        streaming = false;
+      }
+    };
 
     const events: AgentEvents = {
       onStep: () => spinner.start('thinking'),
@@ -167,11 +207,7 @@ export class Repl implements ApprovalPrompt {
       },
 
       onToolStart: ({ name, summary }) => {
-        spinner.stop();
-        if (streaming) {
-          renderer.end();
-          streaming = false;
-        }
+        stopStreaming();
         process.stdout.write(`${toolStartLine(name, summary)}\n`);
         spinner.start(`${name}…`);
       },
@@ -181,6 +217,14 @@ export class Repl implements ApprovalPrompt {
         process.stdout.write(`${toolEndLine(ok, display, durationMs)}\n`);
       },
 
+      onCompaction: (result) => {
+        spinner.stop();
+        const freed = result.tokensBefore - result.tokensAfter;
+        process.stdout.write(
+          `${notice(`context compacted: ${result.removedMessages} messages, ~${freed.toLocaleString()} tokens freed`)}\n`,
+        );
+      },
+
       onNotice: (message) => {
         spinner.stop();
         process.stdout.write(`${notice(message)}\n`);
@@ -188,98 +232,121 @@ export class Repl implements ApprovalPrompt {
     };
 
     try {
-      await this.agent.run(input, events, this.controller.signal);
+      await this.agent.run(input, events, this.turnController.signal);
       if (streaming) renderer.end();
     } catch (error) {
-      spinner.stop();
-      if (streaming) renderer.end();
-      if (isAbort(error)) {
-        process.stdout.write(`${style.yellow('  interrupted')}\n`);
-      } else {
-        process.stdout.write(`${style.red('  error: ')}${errorMessage(error)}\n`);
-      }
+      stopStreaming();
+      process.stdout.write(
+        isAbort(error)
+          ? `${style.yellow('  interrupted')}\n`
+          : `${style.red('  error: ')}${errorMessage(error)}\n`,
+      );
     } finally {
       spinner.stop();
       this.busy = false;
-      this.controller = null;
+      this.turnController = null;
     }
   }
 
-  /* ------------------------------------------------------------ approvals */
-
-  async ask(request: ConfirmRequest): Promise<ConfirmOutcome> {
-    const lines = [
-      '',
-      `${style.yellow('?')} ${style.bold(request.summary)}`,
-      ...(request.detail ? [indentDetail(request.detail)] : []),
-      style.gray(`  [y] yes   [a] always allow ${request.toolName}   [n] no`),
-    ];
-    process.stdout.write(`${lines.join('\n')}\n`);
-
-    const answer = await this.question(style.cyan('  › '));
-    if (answer === null) return 'reject'; // input closed mid-question
-
-    const normalized = answer.trim().toLowerCase();
-    if (normalized === 'a' || normalized === 'always') return 'always';
-    if (normalized === '' || normalized === 'y' || normalized === 'yes') return 'once';
-    return 'reject';
+  private slashContext() {
+    return {
+      config: this.config,
+      session: this.session,
+      approval: this.approval,
+      tools: this.tools,
+      provider: this.provider,
+      agent: this.agent,
+      print: (text: string) => process.stdout.write(`${text}\n`),
+      requestExit: () => {
+        this.exiting = true;
+        this.input.close();
+      },
+      requestResume: (id: string) => this.resume(id),
+    };
   }
 
-  /** Resolves to null if stdin closes while we are waiting, so EOF never reads as consent. */
+  private resume(id: string): void {
+    const snapshot = findSession(id);
+
+    if (!snapshot) {
+      process.stdout.write(style.yellow(`  no session found for "${id}" — try /sessions\n`));
+      return;
+    }
+
+    this.session.restore(snapshot);
+    process.stdout.write(
+      `  resumed ${style.cyan(snapshot.id.slice(0, 8))} ` +
+        style.gray(`(${snapshot.messages.length} messages, ${snapshot.turns} turns)\n`),
+    );
+  }
+
+  private persist(session: Session): void {
+    if (!this.config.persistSessions) return;
+
+    try {
+      saveSnapshot(session.snapshot());
+    } catch {
+      return;
+    }
+  }
+
   private question(prompt: string): Promise<string | null> {
     return new Promise((resolve) => {
       let settled = false;
+
       const finish = (value: string | null) => {
         if (settled) return;
         settled = true;
-        this.rl.off('close', onClose);
+        this.input.off('close', onClose);
         resolve(value);
       };
+
       const onClose = () => finish(null);
 
-      this.rl.once('close', onClose);
-      // rl.question consumes the next line without emitting a 'line' event,
-      // so the main input handler stays out of the way here.
-      this.rl.question(prompt, (answer) => finish(answer));
+      this.input.once('close', onClose);
+      this.input.question(prompt, (answer) => finish(answer));
     });
   }
 
-  /* ------------------------------------------------------------- controls */
-
   private onInterrupt(): void {
-    if (this.busy && this.controller) {
-      this.controller.abort();
+    if (this.busy && this.turnController) {
+      this.turnController.abort();
       process.stdout.write(`\n${style.yellow('  interrupting…')}\n`);
       return;
     }
 
     if (this.interruptArmed) {
       this.exiting = true;
-      this.rl.close();
+      this.input.close();
       return;
     }
 
     this.interruptArmed = true;
     process.stdout.write(`\n${style.gray('  press Ctrl+C again to exit, or Ctrl+D')}\n`);
-    this.rl.prompt();
+    this.input.prompt();
   }
 
   private complete(line: string): [string[], string] {
-    if (line.startsWith('/')) {
-      const matches = commandNames().filter((name) => name.startsWith(line));
-      return [matches.length ? matches : commandNames(), line];
-    }
-    return [[], line];
+    if (!line.startsWith('/')) return [[], line];
+
+    const matches = commandNames().filter((name) => name.startsWith(line));
+    return [matches.length > 0 ? matches : commandNames(), line];
   }
 
   private printFarewell(): void {
     const { costUsd, turns } = this.session.totals();
+
     if (turns === 0) {
       process.stdout.write('\n');
       return;
     }
+
+    const resumeHint = this.config.persistSessions
+      ? ` · resume with sable --resume ${this.session.id.slice(0, 8)}`
+      : '';
+
     process.stdout.write(
-      `\n${style.gray(`${turns} turn${turns === 1 ? '' : 's'} · estimated ${formatCost(costUsd)}`)}\n`,
+      `\n${style.gray(`${turns} turn${turns === 1 ? '' : 's'} · estimated ${formatCost(costUsd)}${resumeHint}`)}\n`,
     );
   }
 }

@@ -1,9 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 
-import { loadProjectContext, type Config } from '../config/config.js';
+import { loadProjectContext, type ApprovalMode, type Config } from '../config/config.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import { tildify } from '../util/paths.js';
+
+const GIT_TIMEOUT_MS = 2000;
 
 const IDENTITY = `You are Sable, an AI agent that works inside a developer's terminal.
 
@@ -32,9 +34,15 @@ const WORKING_STYLE = `## How to work
 ## Tool use
 
 - Batch independent reads: several read_file or grep calls in one step is normal.
-- Anything with side effects (write_file, edit_file, shell) may prompt the user for
-  approval. A refusal is an answer, not an error to route around — adjust and
-  continue, or explain why you cannot.
+- Use glob to find files by name and grep to find them by content. Reading a file
+  you located with either is cheaper than listing directories one level at a time.
+- Making several changes to one file is one multi_edit call, not several edit_file
+  calls. It applies every edit or none, so the file is never left half-changed.
+- Read a file before editing it. Edits against contents you have not seen are
+  rejected, as are edits to a file that changed on disk after you read it.
+- Anything with side effects may prompt the user for approval. A refusal is an
+  answer, not an error to route around — adjust and continue, or explain why you
+  cannot.
 - shell runs a fresh shell each time; \`cd\` does not persist. Pass \`cwd\` instead.
 - Paths are relative to the workspace root. You cannot reach outside it.
 
@@ -48,45 +56,44 @@ the user watched the tool calls scroll by and does not need them recapped.`;
 export interface PromptOptions {
   config: Config;
   tools: ToolRegistry;
-  /** Overridable for tests. */
   now?: Date;
 }
 
 export function buildSystemPrompt({ config, tools, now = new Date() }: PromptOptions): string {
-  const sections: string[] = [IDENTITY, WORKING_STYLE];
-
-  sections.push(
-    [
-      '## Environment',
-      '',
-      `- Workspace root: ${tildify(config.workspaceRoot)}`,
-      `- Platform: ${os.platform()} (${os.arch()})`,
-      `- Today: ${now.toISOString().slice(0, 10)}`,
-      `- Approval mode: ${config.approval}${approvalNote(config.approval)}`,
-      `- Available tools: ${tools.names().join(', ')}`,
-      gitSummary(config.workspaceRoot),
-    ]
-      .filter(Boolean)
-      .join('\n'),
-  );
-
-  const context = loadProjectContext(config);
-  if (context.length > 0) {
-    sections.push(
-      [
-        '## Project context',
-        '',
-        'The user has committed the following instructions to this repository.',
-        'Treat them as standing requirements for work in this workspace.',
-        ...context.map(({ file, content }) => `\n### ${file}\n\n${content}`),
-      ].join('\n'),
-    );
-  }
-
-  return sections.join('\n\n');
+  return [IDENTITY, WORKING_STYLE, environmentSection(config, tools, now), projectSection(config)]
+    .filter((section) => section.length > 0)
+    .join('\n\n');
 }
 
-function approvalNote(mode: Config['approval']): string {
+function environmentSection(config: Config, tools: ToolRegistry, now: Date): string {
+  return [
+    '## Environment',
+    '',
+    `- Workspace root: ${tildify(config.workspaceRoot)}`,
+    `- Platform: ${os.platform()} (${os.arch()})`,
+    `- Today: ${now.toISOString().slice(0, 10)}`,
+    `- Approval mode: ${config.approval}${approvalNote(config.approval)}`,
+    `- Available tools: ${tools.names().join(', ')}`,
+    gitSummary(config.workspaceRoot),
+  ]
+    .filter((line) => line.length > 0)
+    .join('\n');
+}
+
+function projectSection(config: Config): string {
+  const context = loadProjectContext(config);
+  if (context.length === 0) return '';
+
+  return [
+    '## Project context',
+    '',
+    'The user has committed the following instructions to this repository.',
+    'Treat them as standing requirements for work in this workspace.',
+    ...context.map(({ file, content }) => `\n### ${file}\n\n${content}`),
+  ].join('\n');
+}
+
+function approvalNote(mode: ApprovalMode): string {
   switch (mode) {
     case 'readonly':
       return ' — you may read but not write or run commands.';
@@ -94,32 +101,30 @@ function approvalNote(mode: Config['approval']): string {
       return ' — file edits apply without asking; commands still need approval.';
     case 'yolo':
       return ' — everything runs without asking, so be correspondingly careful.';
-    default:
+    case 'prompt':
       return ' — writes and commands are shown to the user for approval.';
   }
 }
 
 function gitSummary(root: string): string {
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], root);
+  if (branch === null) return '';
+
+  const status = git(['status', '--porcelain'], root) ?? '';
+  const state = status ? `${status.split('\n').length} file(s) with uncommitted changes` : 'clean';
+
+  return `- Git: on branch ${branch}, working tree ${state}`;
+}
+
+function git(args: string[], cwd: string): string | null {
   try {
-    const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
-      cwd: root,
+    return execFileSync('git', args, {
+      cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2000,
+      timeout: GIT_TIMEOUT_MS,
     }).trim();
-
-    const status = execFileSync('git', ['status', '--porcelain'], {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2000,
-    }).trim();
-
-    const dirty = status
-      ? `${status.split('\n').length} file(s) with uncommitted changes`
-      : 'clean';
-    return `- Git: on branch ${branch}, working tree ${dirty}`;
   } catch {
-    return '';
+    return null;
   }
 }

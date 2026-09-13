@@ -3,12 +3,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test, { describe } from 'node:test';
 
-import { Session } from '../src/agent/session.js';
 import { parseArgs } from '../src/cli/args.js';
 import { StreamRenderer } from '../src/cli/render.js';
-import { loadConfig } from '../src/config/config.js';
+import { DEFAULT_MODELS, loadConfig } from '../src/config/config.js';
 import { resolveWithin } from '../src/util/paths.js';
 import { tempWorkspace } from './helpers.js';
+
+function writeProjectConfig(root: string, config: object): void {
+  fs.mkdirSync(path.join(root, '.sable'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.sable/config.json'), JSON.stringify(config));
+}
 
 describe('parseArgs', () => {
   test('treats bare words as the prompt', () => {
@@ -17,6 +21,7 @@ describe('parseArgs', () => {
 
   test('reads flags with values', () => {
     const args = parseArgs(['-m', 'claude-opus-4-1', '-C', '/tmp', '--max-steps', '5', 'go']);
+
     assert.equal(args.model, 'claude-opus-4-1');
     assert.equal(args.cwd, '/tmp');
     assert.equal(args.maxSteps, 5);
@@ -25,12 +30,27 @@ describe('parseArgs', () => {
 
   test('--json implies --print', () => {
     const args = parseArgs(['--json', 'go']);
+
     assert.equal(args.json, true);
     assert.equal(args.print, true);
   });
 
   test('--yolo is shorthand for the approval mode', () => {
     assert.equal(parseArgs(['--yolo']).approval, 'yolo');
+  });
+
+  test('reads the session flags', () => {
+    assert.equal(parseArgs(['--resume', 'abc123']).resume, 'abc123');
+    assert.equal(parseArgs(['--continue']).continueLatest, true);
+    assert.equal(parseArgs(['-c']).continueLatest, true);
+    assert.equal(parseArgs(['--no-persist']).persist, false);
+  });
+
+  test('reads provider and compaction flags', () => {
+    const args = parseArgs(['--provider', 'openai', '--compact-at', '50000']);
+
+    assert.equal(args.provider, 'openai');
+    assert.equal(args.compactAt, 50_000);
   });
 
   test('rejects an unknown approval mode', () => {
@@ -53,29 +73,47 @@ describe('parseArgs', () => {
 describe('loadConfig', () => {
   test('project config overrides user defaults', () => {
     const root = tempWorkspace({});
-    fs.mkdirSync(path.join(root, '.sable'), { recursive: true });
-    fs.writeFileSync(
-      path.join(root, '.sable/config.json'),
-      JSON.stringify({ model: 'from-project', maxSteps: 7 }),
-    );
+    writeProjectConfig(root, { model: 'from-project', maxSteps: 7 });
 
     const config = loadConfig({ workspaceRoot: root });
+
     assert.equal(config.model, 'from-project');
     assert.equal(config.maxSteps, 7);
   });
 
   test('explicit overrides beat the config file', () => {
     const root = tempWorkspace({});
-    fs.mkdirSync(path.join(root, '.sable'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.sable/config.json'), JSON.stringify({ model: 'from-file' }));
+    writeProjectConfig(root, { model: 'from-file' });
 
     assert.equal(loadConfig({ workspaceRoot: root, model: 'from-flag' }).model, 'from-flag');
   });
 
+  test('picks the default model for the chosen provider', () => {
+    const root = tempWorkspace({});
+
+    assert.equal(loadConfig({ workspaceRoot: root }).model, DEFAULT_MODELS['anthropic']);
+    assert.equal(
+      loadConfig({ workspaceRoot: root, provider: 'openai' }).model,
+      DEFAULT_MODELS['openai'],
+    );
+  });
+
+  test('reads the API key for the selected provider', () => {
+    const root = tempWorkspace({});
+    const previous = process.env['OPENAI_API_KEY'];
+    process.env['OPENAI_API_KEY'] = 'openai-key';
+
+    try {
+      assert.equal(loadConfig({ workspaceRoot: root, provider: 'openai' }).apiKey, 'openai-key');
+    } finally {
+      if (previous === undefined) delete process.env['OPENAI_API_KEY'];
+      else process.env['OPENAI_API_KEY'] = previous;
+    }
+  });
+
   test('rejects an invalid approval mode from a config file', () => {
     const root = tempWorkspace({});
-    fs.mkdirSync(path.join(root, '.sable'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.sable/config.json'), JSON.stringify({ approval: 'nope' }));
+    writeProjectConfig(root, { approval: 'nope' });
 
     assert.throws(() => loadConfig({ workspaceRoot: root }), /Unknown approval mode/);
   });
@@ -86,6 +124,13 @@ describe('loadConfig', () => {
     fs.writeFileSync(path.join(root, '.sable/config.json'), '{ not json');
 
     assert.throws(() => loadConfig({ workspaceRoot: root }), /Invalid JSON/);
+  });
+
+  test('rejects a nonsense compaction threshold', () => {
+    const root = tempWorkspace({});
+    writeProjectConfig(root, { compactAtTokens: 0 });
+
+    assert.throws(() => loadConfig({ workspaceRoot: root }), /compactAtTokens/);
   });
 });
 
@@ -102,35 +147,12 @@ describe('resolveWithin', () => {
   });
 });
 
-describe('Session', () => {
-  test('trims only at a clean exchange boundary', () => {
-    const session = new Session('m');
-    session.append({ role: 'user', content: [{ type: 'text', text: 'one' }] });
-    session.append({
-      role: 'assistant',
-      content: [{ type: 'tool_use', id: 't1', name: 'read_file', input: {} }],
-    });
-    session.append({
-      role: 'user',
-      content: [{ type: 'tool_result', toolUseId: 't1', content: 'x', isError: false }],
-    });
-    session.append({ role: 'assistant', content: [{ type: 'text', text: 'done' }] });
-    session.append({ role: 'user', content: [{ type: 'text', text: 'two' }] });
-
-    session.trimTo(2);
-    const first = session.history()[0];
-
-    assert.equal(first?.role, 'user');
-    assert.ok(first?.content.every((block) => block.type !== 'tool_result'));
-  });
-});
-
 describe('StreamRenderer', () => {
   test('writes complete lines as they arrive and flushes the tail', () => {
     const written: string[] = [];
-    const fake = { write: (chunk: string) => written.push(chunk) } as unknown as NodeJS.WriteStream;
+    const sink = { write: (chunk: string) => written.push(chunk) } as unknown as NodeJS.WriteStream;
 
-    const renderer = new StreamRenderer(fake);
+    const renderer = new StreamRenderer(sink);
     renderer.write('hello ');
     assert.equal(written.length, 0, 'a partial line should not be emitted yet');
 
@@ -139,5 +161,14 @@ describe('StreamRenderer', () => {
 
     renderer.end();
     assert.match(written.join(''), /second/);
+  });
+
+  test('reports whether anything has been written', () => {
+    const sink = { write: () => true } as unknown as NodeJS.WriteStream;
+    const renderer = new StreamRenderer(sink);
+
+    assert.equal(renderer.isEmpty, true);
+    renderer.write('x');
+    assert.equal(renderer.isEmpty, false);
   });
 });

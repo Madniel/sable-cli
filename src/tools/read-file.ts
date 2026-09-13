@@ -1,11 +1,11 @@
 import fs from 'node:fs';
 
-import { objectSchema } from './schema.js';
 import { isProbablyBinary, rel, resolveOrThrow, truncate } from './fs-utils.js';
+import { objectSchema } from './schema.js';
 import { fail, ok, type Tool, type ToolContext, type ToolResult } from './types.js';
 
-const MAX_CHARS = 120_000;
-const DEFAULT_LIMIT = 2000;
+const MAX_OUTPUT_CHARS = 120_000;
+const DEFAULT_LINE_LIMIT = 2000;
 
 export const readFileTool: Tool = {
   name: 'read_file',
@@ -26,62 +26,73 @@ export const readFileTool: Tool = {
       },
       limit: {
         type: 'integer',
-        description: `Maximum lines to return. Defaults to ${DEFAULT_LIMIT}.`,
+        description: `Maximum lines to return. Defaults to ${DEFAULT_LINE_LIMIT}.`,
         minimum: 1,
-        default: DEFAULT_LIMIT,
+        default: DEFAULT_LINE_LIMIT,
       },
     },
     ['path'],
   ),
 
   summarize(params) {
-    const offset = params['offset'] as number;
-    const suffix = offset && offset > 1 ? ` from line ${offset}` : '';
+    const offset = Number(params['offset'] ?? 1);
+    const suffix = offset > 1 ? ` from line ${offset}` : '';
     return `read ${String(params['path'])}${suffix}`;
   },
 
-  async run(params, ctx: ToolContext): Promise<ToolResult> {
-    const file = resolveOrThrow(ctx.root, String(params['path']), 'read_file');
-    const offset = (params['offset'] as number | undefined) ?? 1;
-    const limit = (params['limit'] as number | undefined) ?? DEFAULT_LIMIT;
+  async run(params, context: ToolContext): Promise<ToolResult> {
+    const file = resolveOrThrow(context.root, String(params['path']), 'read_file');
+    const offset = Number(params['offset'] ?? 1);
+    const limit = Number(params['limit'] ?? DEFAULT_LINE_LIMIT);
 
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(file);
-    } catch {
-      return fail(`read_file: no such file: ${rel(ctx.root, file)}`);
-    }
+    const stat = statOrNull(file);
+    if (!stat) return fail(`read_file: no such file: ${rel(context.root, file)}`);
 
     if (stat.isDirectory()) {
-      return fail(`read_file: ${rel(ctx.root, file)} is a directory. Use list_dir instead.`);
+      return fail(`read_file: ${rel(context.root, file)} is a directory. Use list_dir instead.`);
     }
-    if (stat.size === 0) {
-      return ok(`(${rel(ctx.root, file)} is empty)`);
-    }
+
+    context.files.record(file);
+
+    if (stat.size === 0) return ok(`(${rel(context.root, file)} is empty)`);
 
     const buffer = fs.readFileSync(file);
     if (isProbablyBinary(buffer)) {
       return fail(
-        `read_file: ${rel(ctx.root, file)} looks like a binary file (${stat.size} bytes); refusing to read it as text.`,
+        `read_file: ${rel(context.root, file)} looks like a binary file (${stat.size} bytes); ` +
+          'refusing to read it as text.',
       );
     }
 
     const lines = buffer.toString('utf8').split('\n');
     const start = Math.min(offset - 1, lines.length);
-    const slice = lines.slice(start, start + limit);
-    const width = String(start + slice.length).length;
+    const selected = lines.slice(start, start + limit);
+    const body = numberLines(selected, start);
+    const remaining = lines.length - (start + selected.length);
 
-    const body = slice
-      .map((line, index) => `${String(start + index + 1).padStart(width, ' ')}  ${line}`)
-      .join('\n');
-
-    const { text } = truncate(body, MAX_CHARS);
-    const remaining = lines.length - (start + slice.length);
-    const footer =
-      remaining > 0
-        ? `\n\n[${remaining} more lines. Continue with offset=${start + slice.length + 1}.]`
-        : '';
-
-    return ok(text + footer, `read ${rel(ctx.root, file)} (${slice.length} lines)`);
+    return ok(
+      truncate(body, MAX_OUTPUT_CHARS).text + continuationHint(remaining, start + selected.length),
+      `read ${rel(context.root, file)} (${selected.length} lines)`,
+    );
   },
 };
+
+function numberLines(lines: string[], startIndex: number): string {
+  const width = String(startIndex + lines.length).length;
+  return lines
+    .map((line, index) => `${String(startIndex + index + 1).padStart(width, ' ')}  ${line}`)
+    .join('\n');
+}
+
+function continuationHint(remaining: number, consumed: number): string {
+  if (remaining <= 0) return '';
+  return `\n\n[${remaining} more lines. Continue with offset=${consumed + 1}.]`;
+}
+
+function statOrNull(file: string): fs.Stats | null {
+  try {
+    return fs.statSync(file);
+  } catch {
+    return null;
+  }
+}

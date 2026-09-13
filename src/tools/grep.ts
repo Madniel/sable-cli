@@ -1,12 +1,22 @@
 import fs from 'node:fs';
-import path from 'node:path';
 
 import { ToolInputError } from '../util/errors.js';
+import { isProbablyBinary, rel, resolveOrThrow, walkFiles } from './fs-utils.js';
+import { globToRegExp } from './glob-pattern.js';
 import { objectSchema } from './schema.js';
-import { IGNORED_DIRECTORIES, isProbablyBinary, rel, resolveOrThrow } from './fs-utils.js';
 import { fail, ok, type Tool, type ToolContext, type ToolResult } from './types.js';
 
 const MAX_FILE_BYTES = 2_000_000;
+const MAX_LINE_LENGTH = 300;
+const DEFAULT_LIMIT = 100;
+
+interface Match {
+  file: string;
+  line: number;
+  text: string;
+  before: string[];
+  after: string[];
+}
 
 export const grepTool: Tool = {
   name: 'grep',
@@ -14,7 +24,8 @@ export const grepTool: Tool = {
   description: [
     'Search file contents with a JavaScript regular expression. Returns matching',
     'lines with file and line number. Filter with `glob` (for example "**/*.ts")',
-    'to keep results tight.',
+    'to keep results tight, and raise `context_lines` when you need to see the',
+    'surrounding code.',
   ].join(' '),
   schema: objectSchema(
     {
@@ -33,146 +44,140 @@ export const grepTool: Tool = {
         description: 'Match case. Defaults to false.',
         default: false,
       },
+      context_lines: {
+        type: 'integer',
+        description: 'Lines of surrounding context to include with each match.',
+        minimum: 0,
+        maximum: 10,
+        default: 0,
+      },
       max_results: {
         type: 'integer',
-        description: 'Maximum matching lines to return. Defaults to 100.',
+        description: `Maximum matching lines to return. Defaults to ${DEFAULT_LIMIT}.`,
         minimum: 1,
         maximum: 1000,
-        default: 100,
+        default: DEFAULT_LIMIT,
       },
     },
     ['pattern'],
   ),
 
   summarize(params) {
-    const where = String(params['path'] ?? '.');
-    return `grep /${String(params['pattern'])}/ in ${where}`;
+    return `grep /${String(params['pattern'])}/ in ${String(params['path'] ?? '.')}`;
   },
 
-  async run(params, ctx: ToolContext): Promise<ToolResult> {
+  async run(params, context: ToolContext): Promise<ToolResult> {
     const pattern = String(params['pattern']);
-    const target = resolveOrThrow(ctx.root, String(params['path'] ?? '.'), 'grep');
-    const maxResults = (params['max_results'] as number | undefined) ?? 100;
-    const globPattern = params['glob'] as string | undefined;
-
-    let regex: RegExp;
-    try {
-      regex = new RegExp(pattern, params['case_sensitive'] === true ? '' : 'i');
-    } catch (cause) {
-      throw new ToolInputError(`grep: invalid regular expression: ${(cause as Error).message}`);
-    }
+    const target = resolveOrThrow(context.root, String(params['path'] ?? '.'), 'grep');
+    const maxResults = Number(params['max_results'] ?? DEFAULT_LIMIT);
+    const contextLines = Number(params['context_lines'] ?? 0);
+    const regex = compile(pattern, params['case_sensitive'] === true);
 
     if (!fs.existsSync(target)) {
-      return fail(`grep: no such path: ${rel(ctx.root, target)}`);
+      return fail(`grep: no such path: ${rel(context.root, target)}`);
     }
 
-    const globRegex = globPattern ? globToRegExp(globPattern) : null;
-    const files: string[] = [];
-    if (fs.statSync(target).isDirectory()) {
-      collectFiles(target, files, ctx);
-    } else {
-      files.push(target);
-    }
+    const globFilter = params['glob'] ? globToRegExp(String(params['glob'])) : null;
+    const files = collectSearchableFiles(target, context);
 
-    const matches: string[] = [];
+    const matches: Match[] = [];
     let scanned = 0;
     let capped = false;
 
     for (const file of files) {
-      if (ctx.signal.aborted) break;
-      const relative = rel(ctx.root, file);
-      if (globRegex && !globRegex.test(relative)) continue;
+      if (context.signal.aborted || capped) break;
 
-      let buffer: Buffer;
-      try {
-        const stat = fs.statSync(file);
-        if (stat.size > MAX_FILE_BYTES) continue;
-        buffer = fs.readFileSync(file);
-      } catch {
-        continue;
-      }
-      if (isProbablyBinary(buffer)) continue;
+      const relative = rel(context.root, file);
+      if (globFilter && !globFilter.test(relative)) continue;
+
+      const lines = readSearchableLines(file);
+      if (!lines) continue;
       scanned++;
 
-      const lines = buffer.toString('utf8').split('\n');
       for (const [index, line] of lines.entries()) {
         if (!regex.test(line)) continue;
-        matches.push(`${relative}:${index + 1}: ${line.trim().slice(0, 300)}`);
+
+        matches.push({
+          file: relative,
+          line: index + 1,
+          text: line,
+          before: contextLines > 0 ? lines.slice(Math.max(0, index - contextLines), index) : [],
+          after: contextLines > 0 ? lines.slice(index + 1, index + 1 + contextLines) : [],
+        });
         if (matches.length >= maxResults) {
           capped = true;
           break;
         }
       }
-      if (capped) break;
     }
 
     if (matches.length === 0) {
       return ok(
-        `No matches for /${pattern}/ in ${rel(ctx.root, target)} (${scanned} files searched).`,
+        `No matches for /${pattern}/ in ${rel(context.root, target)} (${scanned} files searched).`,
         `grep: no matches (${scanned} files)`,
       );
     }
 
+    const rendered = contextLines > 0 ? renderWithContext(matches) : renderPlain(matches);
     const footer = capped ? `\n\n[capped at ${maxResults} matches]` : '';
+
     return ok(
-      `${matches.length} match${matches.length === 1 ? '' : 'es'} in ${scanned} files:\n\n` +
-        matches.join('\n') +
-        footer,
+      `${matches.length} match${matches.length === 1 ? '' : 'es'} in ${scanned} files:\n\n${rendered}${footer}`,
       `grep: ${matches.length} matches`,
     );
   },
 };
 
-function collectFiles(dir: string, out: string[], ctx: ToolContext, depth = 0): void {
-  if (depth > 12 || ctx.signal.aborted || out.length > 20_000) return;
-  let entries: fs.Dirent[];
+function compile(pattern: string, caseSensitive: boolean): RegExp {
   try {
-    entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    const child = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (IGNORED_DIRECTORIES.has(entry.name)) continue;
-      collectFiles(child, out, ctx, depth + 1);
-    } else if (entry.isFile()) {
-      out.push(child);
-    }
+    return new RegExp(pattern, caseSensitive ? '' : 'i');
+  } catch (cause) {
+    throw new ToolInputError(`grep: invalid regular expression: ${(cause as Error).message}`);
   }
 }
 
-/** Translate a shell-style glob into a RegExp. Supports `*`, `**`, `?` and character classes. */
-export function globToRegExp(glob: string): RegExp {
-  let source = '';
-  for (let i = 0; i < glob.length; i++) {
-    const char = glob[i] as string;
-    if (char === '*') {
-      if (glob[i + 1] === '*') {
-        // `**/` matches any number of leading directories, including none.
-        if (glob[i + 2] === '/') {
-          source += '(?:.*/)?';
-          i += 2;
-        } else {
-          source += '.*';
-          i += 1;
-        }
-      } else {
-        source += '[^/]*';
-      }
-    } else if (char === '?') {
-      source += '[^/]';
-    } else if (char === '[') {
-      const end = glob.indexOf(']', i);
-      if (end === -1) {
-        source += '\\[';
-      } else {
-        source += glob.slice(i, end + 1);
-        i = end;
-      }
-    } else {
-      source += char.replace(/[.+^${}()|\\]/g, '\\$&');
-    }
+function collectSearchableFiles(target: string, context: ToolContext): string[] {
+  if (!fs.statSync(target).isDirectory()) return [target];
+
+  const files: string[] = [];
+  walkFiles(target, context, (file) => files.push(file));
+  return files;
+}
+
+function readSearchableLines(file: string): string[] | null {
+  try {
+    const stat = fs.statSync(file);
+    if (stat.size > MAX_FILE_BYTES) return null;
+
+    const buffer = fs.readFileSync(file);
+    if (isProbablyBinary(buffer)) return null;
+
+    return buffer.toString('utf8').split('\n');
+  } catch {
+    return null;
   }
-  return new RegExp(`^${source}$`);
+}
+
+function renderPlain(matches: Match[]): string {
+  return matches
+    .map((match) => `${match.file}:${match.line}: ${match.text.trim().slice(0, MAX_LINE_LENGTH)}`)
+    .join('\n');
+}
+
+function renderWithContext(matches: Match[]): string {
+  return matches
+    .map((match) => {
+      const firstLine = match.line - match.before.length;
+      const rendered = [
+        ...match.before.map((text, offset) => gutter(firstLine + offset, text, false)),
+        gutter(match.line, match.text, true),
+        ...match.after.map((text, offset) => gutter(match.line + offset + 1, text, false)),
+      ];
+      return [`${match.file}:${match.line}`, ...rendered].join('\n');
+    })
+    .join('\n\n');
+}
+
+function gutter(lineNumber: number, text: string, isMatch: boolean): string {
+  return `${isMatch ? '>' : ' '} ${lineNumber}: ${text.slice(0, MAX_LINE_LENGTH)}`;
 }

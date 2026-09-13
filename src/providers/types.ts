@@ -1,10 +1,3 @@
-/**
- * Provider-agnostic message and streaming types.
- *
- * The agent loop only ever speaks this vocabulary; each provider adapter
- * translates to and from its own wire format.
- */
-
 export interface TextBlock {
   type: 'text';
   text: string;
@@ -40,7 +33,6 @@ export interface Message {
 export interface ToolSpec {
   name: string;
   description: string;
-  /** JSON Schema describing the tool's input object. */
   parameters: Record<string, unknown>;
 }
 
@@ -76,9 +68,12 @@ export function addUsage(a: Usage, b: Usage): Usage {
   };
 }
 
+export function totalTokens(usage: Usage): number {
+  return usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
+}
+
 export type StopReason = 'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' | 'unknown';
 
-/** Incremental events emitted while a completion streams in. */
 export type StreamEvent =
   | { type: 'text_delta'; text: string }
   | { type: 'thinking_delta'; text: string }
@@ -88,18 +83,14 @@ export type StreamEvent =
   | { type: 'usage'; usage: Usage };
 
 export interface CompletionResult {
-  /** The assistant message, assembled from the stream. */
   message: Message;
   stopReason: StopReason;
   usage: Usage;
 }
 
 export interface Provider {
-  /** Stable identifier, e.g. `anthropic`. */
   readonly id: string;
-  /** Human-readable name for help output. */
   readonly label: string;
-  /** Models this adapter is known to work with; informational only. */
   readonly knownModels: readonly string[];
 
   complete(
@@ -108,10 +99,6 @@ export interface Provider {
     signal?: AbortSignal,
   ): Promise<CompletionResult>;
 }
-
-/* -------------------------------------------------------------------------- */
-/* Small helpers for working with content blocks                              */
-/* -------------------------------------------------------------------------- */
 
 export function textOf(message: Message): string {
   return message.content
@@ -126,4 +113,12 @@ export function toolUsesOf(message: Message): ToolUseBlock[] {
 
 export function userText(text: string): Message {
   return { role: 'user', content: [{ type: 'text', text }] };
+}
+
+export function assistantText(text: string): Message {
+  return { role: 'assistant', content: [{ type: 'text', text }] };
+}
+
+export function startsExchange(message: Message): boolean {
+  return message.role === 'user' && !message.content.some((block) => block.type === 'tool_result');
 }

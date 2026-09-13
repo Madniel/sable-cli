@@ -1,107 +1,102 @@
-import { colorEnabled, cursor, style, terminalWidth } from '../util/ansi.js';
+import { colorEnabled, cursor, style, terminalWidth, truncateToWidth } from '../util/ansi.js';
 
-/* -------------------------------------------------------------------------- */
-/* Streaming markdown                                                         */
-/* -------------------------------------------------------------------------- */
+const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_INTERVAL_MS = 90;
+const ELAPSED_THRESHOLD_SECONDS = 2;
+const SLOW_TOOL_MS = 1500;
 
-/**
- * Renders model output as it streams. Styling is applied per completed line,
- * which is the only way to do this without buffering the whole response: a
- * half-arrived `**bold` is not yet anything.
- */
 export class StreamRenderer {
   private buffer = '';
-  private inFence = false;
-  private wroteAnything = false;
+  private insideCodeFence = false;
+  private hasWritten = false;
 
   constructor(private readonly out: NodeJS.WriteStream = process.stdout) {}
 
   write(delta: string): void {
     this.buffer += delta;
-    let newline = this.buffer.indexOf('\n');
-    while (newline !== -1) {
+
+    for (
+      let newline = this.buffer.indexOf('\n');
+      newline !== -1;
+      newline = this.buffer.indexOf('\n')
+    ) {
       this.emit(this.buffer.slice(0, newline));
       this.buffer = this.buffer.slice(newline + 1);
-      newline = this.buffer.indexOf('\n');
     }
   }
 
-  /** Flush whatever is left and end the block. */
   end(): void {
     if (this.buffer) {
       this.emit(this.buffer);
       this.buffer = '';
     }
-    if (this.wroteAnything) this.out.write('\n');
-    this.inFence = false;
-    this.wroteAnything = false;
+
+    if (this.hasWritten) this.out.write('\n');
+
+    this.insideCodeFence = false;
+    this.hasWritten = false;
   }
 
   get isEmpty(): boolean {
-    return !this.wroteAnything && this.buffer.length === 0;
+    return !this.hasWritten && this.buffer.length === 0;
   }
 
   private emit(line: string): void {
-    this.wroteAnything = true;
-    this.out.write(`${this.styleLine(line)}\n`);
+    this.hasWritten = true;
+    this.out.write(`${this.decorate(line)}\n`);
   }
 
-  private styleLine(line: string): string {
+  private decorate(line: string): string {
     if (!colorEnabled()) return line;
 
     if (/^\s*```/.test(line)) {
-      this.inFence = !this.inFence;
+      this.insideCodeFence = !this.insideCodeFence;
       const language = line.replace(/^\s*```/, '').trim();
-      return style.gray(this.inFence && language ? `  ${language}` : '  ─');
+      return style.gray(this.insideCodeFence && language ? `  ${language}` : '  ─');
     }
 
-    if (this.inFence) return style.cyan(`  ${line}`);
+    if (this.insideCodeFence) return style.cyan(`  ${line}`);
 
     const heading = /^(#{1,6})\s+(.*)$/.exec(line);
     if (heading) return style.bold(style.cyan(heading[2] ?? ''));
 
-    if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
-      return inline(
-        line.replace(/^(\s*)([-*+])\s+/, (_m, space: string) => `${space}${style.cyan('•')} `),
-      );
-    }
-
     if (/^\s*>\s?/.test(line)) return style.gray(line);
 
-    return inline(line);
+    if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
+      const bulleted = line.replace(
+        /^(\s*)([-*+])\s+/,
+        (_match, indent: string) => `${indent}${style.cyan('•')} `,
+      );
+      return decorateInline(bulleted);
+    }
+
+    return decorateInline(line);
   }
 }
 
-function inline(text: string): string {
+function decorateInline(text: string): string {
   return text
-    .replace(/`([^`]+)`/g, (_m, code: string) => style.cyan(code))
-    .replace(/\*\*([^*]+)\*\*/g, (_m, bold: string) => style.bold(bold))
+    .replace(/`([^`]+)`/g, (_match, code: string) => style.cyan(code))
+    .replace(/\*\*([^*]+)\*\*/g, (_match, bold: string) => style.bold(bold))
     .replace(
       /(^|\s)_([^_]+)_(?=\s|$)/g,
-      (_m, lead: string, em: string) => `${lead}${style.italic(em)}`,
+      (_match, lead: string, emphasis: string) => `${lead}${style.italic(emphasis)}`,
     );
 }
 
-/* -------------------------------------------------------------------------- */
-/* Spinner                                                                    */
-/* -------------------------------------------------------------------------- */
-
-const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
 export class Spinner {
   private timer: NodeJS.Timeout | null = null;
-  private frame = 0;
+  private frameIndex = 0;
   private label = '';
-  private readonly startedAt = Date.now();
+  private startedAt = Date.now();
 
   start(label: string): void {
     this.label = label;
-    if (!colorEnabled() || this.timer) {
-      if (this.timer) return;
-      return;
-    }
+    if (!colorEnabled() || this.timer) return;
+
+    this.startedAt = Date.now();
     cursor.hide();
-    this.timer = setInterval(() => this.tick(), 90);
+    this.timer = setInterval(() => this.tick(), SPINNER_INTERVAL_MS);
     this.timer.unref?.();
     this.tick();
   }
@@ -112,6 +107,7 @@ export class Spinner {
 
   stop(): void {
     if (!this.timer) return;
+
     clearInterval(this.timer);
     this.timer = null;
     cursor.clearLine();
@@ -120,21 +116,16 @@ export class Spinner {
 
   private tick(): void {
     const seconds = Math.floor((Date.now() - this.startedAt) / 1000);
-    const frame = FRAMES[this.frame % FRAMES.length] ?? '-';
-    this.frame++;
-    const text = `${frame} ${this.label}${seconds > 2 ? style.gray(` ${seconds}s`) : ''}`;
+    const frame = SPINNER_FRAMES[this.frameIndex % SPINNER_FRAMES.length] ?? '-';
+    this.frameIndex++;
+
+    const elapsed = seconds > ELAPSED_THRESHOLD_SECONDS ? style.gray(` ${seconds}s`) : '';
     cursor.clearLine();
-    process.stderr.write(truncateToWidth(style.cyan(text), terminalWidth() - 1));
+    process.stderr.write(
+      truncateToWidth(style.cyan(`${frame} ${this.label}${elapsed}`), terminalWidth() - 1),
+    );
   }
 }
-
-function truncateToWidth(text: string, width: number): string {
-  return text.length <= width ? text : `${text.slice(0, Math.max(0, width - 1))}…`;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Tool call lines                                                            */
-/* -------------------------------------------------------------------------- */
 
 export function toolStartLine(name: string, summary: string): string {
   return `${style.gray('›')} ${style.bold(name)} ${style.gray(summary)}`;
@@ -142,34 +133,36 @@ export function toolStartLine(name: string, summary: string): string {
 
 export function toolEndLine(ok: boolean, display: string, durationMs: number): string {
   const mark = ok ? style.green('✓') : style.red('✗');
-  const time = durationMs > 1500 ? style.gray(` ${(durationMs / 1000).toFixed(1)}s`) : '';
-  return `  ${mark} ${style.gray(display)}${time}`;
+  const elapsed =
+    durationMs > SLOW_TOOL_MS ? style.gray(` ${(durationMs / 1000).toFixed(1)}s`) : '';
+  return `  ${mark} ${style.gray(display)}${elapsed}`;
 }
 
 export function notice(text: string): string {
   return style.yellow(`! ${text}`);
 }
 
-export function banner(model: string, root: string, approval: string): string {
-  const lines = [
+export function banner(model: string, root: string, approval: string, provider: string): string {
+  return [
+    '',
     `${style.bold(style.cyan('sable'))} ${style.gray('· an AI agent in your terminal')}`,
-    `${style.gray('model')}    ${model}`,
+    `${style.gray('model')}    ${model} ${style.gray(`(${provider})`)}`,
     `${style.gray('cwd')}      ${root}`,
     `${style.gray('approval')} ${approval}`,
     style.gray('/help for commands, Ctrl+C to interrupt, Ctrl+D to exit'),
-  ];
-  return `\n${lines.join('\n')}\n`;
+    '',
+  ].join('\n');
 }
 
-/** Indent a block of detail text (a diff, a command) for an approval prompt. */
 export function indentDetail(detail: string): string {
-  return detail
-    .split('\n')
-    .map((line) => {
-      if (line.startsWith('+')) return `  ${style.green(line)}`;
-      if (line.startsWith('-')) return `  ${style.red(line)}`;
-      if (line.startsWith('$')) return `  ${style.bold(line)}`;
-      return `  ${style.gray(line)}`;
-    })
-    .join('\n');
+  return detail.split('\n').map(colorizeDetailLine).join('\n');
+}
+
+function colorizeDetailLine(line: string): string {
+  if (line.startsWith('@@')) return `  ${style.magenta(line)}`;
+  if (line.startsWith('+')) return `  ${style.green(line)}`;
+  if (line.startsWith('-')) return `  ${style.red(line)}`;
+  if (line.startsWith('$')) return `  ${style.bold(line)}`;
+  if (line.trimStart().startsWith('!')) return `  ${style.yellow(line)}`;
+  return `  ${style.gray(line)}`;
 }
