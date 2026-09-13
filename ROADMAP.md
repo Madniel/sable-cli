@@ -5,50 +5,58 @@ approval → terminal. Everything below hangs off that without redesigning it.
 
 ## Built
 
-- [x] Streaming Anthropic adapter (SSE parsed by hand, retries with backoff, prompt caching)
+- [x] Provider abstraction with two working backends: Anthropic (SSE, prompt
+      caching) and OpenAI (chat completions, `tool_calls`), sharing retry with
+      backoff and `retry-after` handling
 - [x] Agentic tool-use loop with a step ceiling and mid-turn interruption
-- [x] Six built-in tools, all sandboxed to the workspace root
-- [x] Four approval modes plus per-tool "always allow"
-- [x] Interactive REPL: streaming markdown, spinner, slash commands, history, completion
+- [x] Eight sandboxed tools, all confined to the workspace root
+- [x] Atomic `multi_edit`: every hunk applies or none do
+- [x] LCS-based unified diffs in approval prompts, coloured in the terminal
+- [x] Staleness guard: an edit to a file that changed after the model read it is
+      refused rather than silently clobbering the user's work
+- [x] Four approval modes plus per-tool "always allow", and risk flagging for
+      obviously destructive shell commands
+- [x] Automatic context compaction past a token threshold, plus `/compact`
+- [x] Session persistence with `--continue`, `--resume`, `/sessions`
+- [x] Interactive REPL: streaming markdown, spinner, slash commands, history,
+      completion
 - [x] One-shot mode (`-p`) and a JSON event stream (`--json`) for scripting
-- [x] Layered config (defaults → user → project → env → flags) and `SABLE.md` project context
-- [x] Session usage and cost estimate
-- [x] Test suite with no network dependency
+- [x] Layered config and `SABLE.md` project context
+- [x] 140 tests on `node:test`, none of which touch the network
 
 ## Next
 
-**Context management.** The session grows until the model refuses it. Needs
-automatic compaction: summarise the oldest exchanges into a synthetic message
-when the history crosses a token threshold, keeping tool-call pairs intact.
-`Session.trimTo` is the placeholder to replace.
+**Better retrieval.** `grep` walks and reads every file itself. A persistent
+index — or shelling out to `rg` when it is on PATH — would make searching a large
+repository an order of magnitude faster.
 
-**Better editing.** `edit_file` is exact-string only. Worth adding: multi-edit in
-one call (atomic — all hunks apply or none do), and a real unified diff in the
-approval prompt instead of the current single-hunk preview.
-
-**File watching / staleness.** If the user edits a file after the model read it,
-the model is working from a stale copy. Track mtimes per read and warn on write.
-
-**Sub-agents.** A `task` tool that spawns a nested loop with its own context and
-a restricted tool set, returning only a summary. Cheap way to keep exploration
-out of the main transcript.
+**Sub-agents.** A `task` tool that spawns a nested loop with its own context and a
+restricted tool set, returning only a summary. The cheapest way to keep noisy
+exploration out of the main transcript.
 
 **MCP client.** Speak the Model Context Protocol so any MCP server's tools appear
 in the registry alongside the built-ins. The `Tool` interface is already the right
-shape for it.
+shape for it; what is missing is the transport and the schema translation.
 
-**More providers.** OpenAI and Gemini adapters. The interface is one method; the
-work is in each one's streaming and tool-call format.
+**Streaming tool arguments to the UI.** The provider already emits
+`tool_use_input_delta`; nothing displays it. Showing a command as it is typed out
+would make approvals feel immediate rather than sudden.
+
+**Smarter truncation.** Tool output is capped by characters. Capping by estimated
+tokens, and trimming from the middle rather than the end, would keep the useful
+parts of a long test run.
+
+**Gemini adapter.** The third wire format, to prove the seam is not accidentally
+shaped around two.
 
 ## Later
 
-- Session persistence and `--resume`
 - `git`-aware tooling: stage a change set, propose a commit message, open a PR
-- A real TUI (alternate screen, scrollback, side-by-side diffs)
-- Hooks: shell commands fired before/after a tool call, for lint or audit
+- A real TUI: alternate screen, scrollback, side-by-side diffs
+- Hooks: shell commands fired before or after a tool call, for lint or audit
 - Permission profiles per directory (`~/work` prompts, `~/scratch` yolo)
-- Structured output mode for CI use
-- Token-aware truncation of tool results, instead of the current character cap
+- Resumable turns: pick up a session mid-tool-call after a crash
+- Cost tracking against real provider pricing rather than a baked-in table
 - `npx sable` distribution and a signed release
 
 ## Non-goals

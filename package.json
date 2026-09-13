@@ -1,6 +1,6 @@
 {
   "name": "sable-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "An open, hackable AI agent for your terminal. Zero runtime dependencies.",
   "type": "module",
   "license": "MIT",
